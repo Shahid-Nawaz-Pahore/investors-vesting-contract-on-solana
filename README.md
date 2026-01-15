@@ -13,8 +13,8 @@ anchor build
 ## Deploy to devnet (PowerShell)
 ```powershell
 solana config set --url https://api.devnet.solana.com
-solana-keygen new -o C:\Users\premier\.config\solana\admin.json
-solana config set --keypair C:\Users\premier\.config\solana\admin.json
+solana-keygen new -o 
+solana config set --keypair 
 solana airdrop 2
 
 cd vesting
