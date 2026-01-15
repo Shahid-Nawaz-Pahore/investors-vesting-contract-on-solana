@@ -2,13 +2,11 @@
 
 ## Run tests (localnet)
 ```bash
-cd vesting
 anchor test
 ```
 
 ## Build
 ```bash
-cd vesting
 anchor build
 ```
 
