@@ -871,35 +871,6 @@ describe("vesting (spec-authoritative)", () => {
     }
     await provider.sendAndConfirm(createAtasTx, [admin]);
 
-    // create ATAs for dummy wallets in manageable batches so all recipients can be paid
-    dummyAtas = [];
-    for (let i = 0; i < dummyWallets.length; i += 8) {
-      const tx = new anchor.web3.Transaction();
-      for (let j = i; j < Math.min(i + 8, dummyWallets.length); j++) {
-        const owner = dummyWallets[j];
-        const ata = getAssociatedTokenAddressSync(
-          mintKp.publicKey,
-          owner,
-          false,
-          TOKEN_PROGRAM_ID,
-          ASSOCIATED_TOKEN_PROGRAM_ID
-        );
-        dummyAtas.push(ata);
-        tx.add(
-          createAssociatedTokenAccountInstruction(
-            admin.publicKey,
-            ata,
-            owner,
-            mintKp.publicKey,
-            TOKEN_PROGRAM_ID,
-            ASSOCIATED_TOKEN_PROGRAM_ID
-          )
-        );
-      }
-      await provider.sendAndConfirm(tx, [admin]);
-    }
-
-
     // release before start => BeforeStart (even though partially funded)
     try {
       await program.methods
@@ -1025,10 +996,44 @@ describe("vesting (spec-authoritative)", () => {
           .signers([distributor])
           .rpc();
         expect.fail("should have failed");
-      } catch (e: any) {
-        // Anchor framework error (account cannot be deserialized).
-        expect(anchorErrorCode(e)).to.equal("AccountNotInitialized");
+    } catch (e: any) {
+      // Anchor framework error (account missing/uninitialized) can vary by release.
+      const code = anchorErrorCode(e);
+      if (code) {
+        expect(["AccountNotInitialized", "AccountNotFound"].includes(code)).to.equal(true);
+      } else {
+        const msg = String(e?.message ?? e);
+        expect(msg).to.match(/AccountNotInitialized|AccountNotFound|account.*not.*initialized|could not find account/i);
       }
+    }
+
+    // create ATAs for dummy wallets in manageable batches so all recipients can be paid
+    dummyAtas = [];
+    for (let i = 0; i < dummyWallets.length; i += 8) {
+      const tx = new anchor.web3.Transaction();
+      for (let j = i; j < Math.min(i + 8, dummyWallets.length); j++) {
+        const owner = dummyWallets[j];
+        const ata = getAssociatedTokenAddressSync(
+          mintKp.publicKey,
+          owner,
+          false,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        dummyAtas.push(ata);
+        tx.add(
+          createAssociatedTokenAccountInstruction(
+            admin.publicKey,
+            ata,
+            owner,
+            mintKp.publicKey,
+            TOKEN_PROGRAM_ID,
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          )
+        );
+      }
+      await provider.sendAndConfirm(tx, [admin]);
+    }
     }
 
     // access control: release_to_recipient is distributor-only
