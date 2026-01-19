@@ -12,8 +12,9 @@ vesting = "61EiRiRNSU4ZEhnn8JpC6L9VRHz6oKvD9YzSP6bNZNWp"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "devnet"
-wallet = "C:\\Users\\premier\\.config\\solana\\admin.json"
+
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
 
 
 [scripts]

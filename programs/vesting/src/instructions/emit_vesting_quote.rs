@@ -10,11 +10,11 @@ pub fn emit_vesting_quote(ctx: Context<EmitVestingQuote>, wallet: Pubkey) -> Res
     let now = Clock::get()?.unix_timestamp;
     let month_idx = time::month_index(now, st.start_ts)?;
 
-    let entry = ctx
-        .accounts
-        .recipients
+    let recipients = &ctx.accounts.recipients;
+    let entry = recipients
         .entries
         .iter()
+        .take(st.recipient_count as usize)
         .find(|e| e.wallet == wallet)
         .ok_or(VestingError::RecipientNotFound)?;
 
@@ -60,7 +60,7 @@ pub struct EmitVestingQuote<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Account<'info, Recipients>,
+    pub recipients: Box<Account<'info, Recipients>>,
 }
 
 #[event]

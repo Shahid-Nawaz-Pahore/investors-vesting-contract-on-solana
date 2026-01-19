@@ -36,6 +36,7 @@ pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) ->
     let entry = recipients
         .entries
         .iter_mut()
+        .take(st.recipient_count as usize)
         .find(|e| e.wallet == wallet)
         .ok_or(VestingError::RecipientNotFound)?;
 
@@ -61,7 +62,7 @@ pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) ->
     );
 
     // If revoked, no-op (stop future releases).
-    if entry.revoked {
+    if entry.revoked != 0 {
         return Ok(());
     }
 
@@ -151,7 +152,7 @@ pub struct ReleaseToRecipient<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Account<'info, Recipients>,
+    pub recipients: Box<Account<'info, Recipients>>,
 
     #[account(
         mut,

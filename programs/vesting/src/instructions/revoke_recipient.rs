@@ -9,12 +9,16 @@ pub fn revoke_recipient(ctx: Context<RevokeRecipient>, wallet: Pubkey) -> Result
 
     let recipients = &mut ctx.accounts.recipients;
     let mut found = false;
-    for e in recipients.entries.iter_mut() {
+    for e in recipients
+        .entries
+        .iter_mut()
+        .take(st.recipient_count as usize)
+    {
         if e.wallet == wallet {
-            if e.revoked {
+            if e.revoked != 0 {
                 return Err(VestingError::RecipientRevoked.into());
             }
-            e.revoked = true;
+            e.revoked = 1;
             found = true;
             break;
         }
@@ -38,7 +42,7 @@ pub struct RevokeRecipient<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Account<'info, Recipients>,
+    pub recipients: Box<Account<'info, Recipients>>,
 
     pub admin: Signer<'info>,
 }

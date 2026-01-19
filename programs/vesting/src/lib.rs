@@ -197,10 +197,11 @@ pub mod vesting {
                 .recipients
                 .entries
                 .iter_mut()
+                .take(st.recipient_count as usize)
                 .find(|e| e.wallet == *wallet)
                 .ok_or(VestingError::RecipientNotFound)?;
 
-            if entry.revoked {
+            if entry.revoked != 0 {
                 continue;
             }
 

@@ -242,6 +242,7 @@ describe("vesting (spec-authoritative)", () => {
   let r4: Keypair;
   let r5: Keypair;
   let r6: Keypair;
+  let dummyAtas: PublicKey[];
 
   const totalSupply = new BN(200_000_000_000_000); // 200M * 10^6
   const DUMMY_COUNT_FOR_MAX_RECIPIENTS_TEST = 29; // 3 initial + 3 real + 29 dummy = 35
@@ -870,6 +871,35 @@ describe("vesting (spec-authoritative)", () => {
     }
     await provider.sendAndConfirm(createAtasTx, [admin]);
 
+    // create ATAs for dummy wallets in manageable batches so all recipients can be paid
+    dummyAtas = [];
+    for (let i = 0; i < dummyWallets.length; i += 8) {
+      const tx = new anchor.web3.Transaction();
+      for (let j = i; j < Math.min(i + 8, dummyWallets.length); j++) {
+        const owner = dummyWallets[j];
+        const ata = getAssociatedTokenAddressSync(
+          mintKp.publicKey,
+          owner,
+          false,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        dummyAtas.push(ata);
+        tx.add(
+          createAssociatedTokenAccountInstruction(
+            admin.publicKey,
+            ata,
+            owner,
+            mintKp.publicKey,
+            TOKEN_PROGRAM_ID,
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          )
+        );
+      }
+      await provider.sendAndConfirm(tx, [admin]);
+    }
+
+
     // release before start => BeforeStart (even though partially funded)
     try {
       await program.methods
@@ -1181,28 +1211,30 @@ describe("vesting (spec-authoritative)", () => {
       expect(afterR5.amount > beforeR5.amount).to.equal(true);
     }
 
-    // revoke recipient: releases become no-op
+    // revoke one small dummy recipient: releases become no-op
+    const revokedWallet = dummyWallets[0];
+    const revokedAta = dummyAtas[0];
     await program.methods
-      .revokeRecipient(r4.publicKey)
+      .revokeRecipient(revokedWallet)
       .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
       .signers([admin])
       .rpc();
-    const before4 = await getAccount(connection, atas[3]);
+    // create a tiny release attempt (will be no-op)
     await program.methods
-      .releaseToRecipient(r4.publicKey)
+      .releaseToRecipient(revokedWallet)
       .accounts({
         scheduleState,
         recipients: recipientsPda,
         vault: vaultPda,
-        recipientAta: atas[3],
+        recipientAta: revokedAta,
         mint: mintKp.publicKey,
         distributor: distributor.publicKey,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([distributor])
       .rpc();
-    const after4 = await getAccount(connection, atas[3]);
-    expect(after4.amount - before4.amount).to.equal(BigInt(0));
+    const revokedAccount = await getAccount(connection, revokedAta);
+    expect(revokedAccount.amount).to.equal(BigInt(0));
 
     // emit quote: should not mutate state (we just ensure tx succeeds)
     // Ensure no state mutation: compare serialized account buffers.
@@ -1215,6 +1247,56 @@ describe("vesting (spec-authoritative)", () => {
     const recipientsAfter = await connection.getAccountInfo(recipientsPda);
     expect(recipientsAfter).to.not.equal(null);
     expect(recipientsAfter!.data.equals(recipientsBefore!.data)).to.equal(true);
+
+    // Full 12-period release with warp (only if validator supports warp)
+    if (warpSupported) {
+      const startDate = new Date(startTsNum * 1000);
+      const allRecipients = [
+        { wallet: r1.publicKey, ata: atas[0] },
+        { wallet: r2.publicKey, ata: atas[1] },
+        { wallet: r3.publicKey, ata: atas[2] },
+        { wallet: r4.publicKey, ata: atas[3] },
+        { wallet: r5.publicKey, ata: atas[4] },
+        { wallet: r6.publicKey, ata: atas[5] },
+        ...dummyWallets.map((w, i) => ({ wallet: w, ata: dummyAtas[i] })),
+      ].filter((p) => !p.wallet.equals(revokedWallet));
+
+      for (let k = 0; k < 12; k++) {
+        const boundary = Math.floor(addMonthsClampedUtc(startDate, k).getTime() / 1000);
+        await warpToUnixTs(connection, boundary);
+
+        for (let i = 0; i < allRecipients.length; i += 5) {
+          const slice = allRecipients.slice(i, i + 5);
+          await program.methods
+            .batchRelease(slice.map((s) => s.wallet))
+            .accounts({
+              scheduleState,
+              recipients: recipientsPda,
+              vault: vaultPda,
+              distributor: distributor.publicKey,
+              tokenProgram: TOKEN_PROGRAM_ID,
+            })
+            .remainingAccounts(slice.map((s) => ({ pubkey: s.ata, isSigner: false, isWritable: true })))
+            .signers([distributor])
+            .rpc();
+        }
+      }
+
+      // Verify all non-revoked recipients are fully released and vault holds only revoked allocation.
+      const rec = await program.account.recipients.fetch(recipientsPda);
+      let outstanding = BigInt(0);
+      for (const e of rec.entries as any[]) {
+        if (new PublicKey(e.wallet).equals(revokedWallet)) {
+          outstanding += BigInt(e.allocation.toString());
+          expect(e.releasedAmount.toString()).to.equal("0");
+        } else {
+          expect(e.releasedAmount.toString()).to.equal(e.allocation.toString());
+        }
+      }
+
+      const vaultState = await getAccount(connection, vaultPda);
+      expect(vaultState.amount).to.equal(outstanding);
+    }
 
     // sweep before end must fail
     try {

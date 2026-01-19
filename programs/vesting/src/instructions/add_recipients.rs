@@ -23,12 +23,12 @@ pub fn add_recipients(
 
         // Enforce cap.
         require!(
-            recipients.entries.len() < MAX_RECIPIENTS,
+            (st.recipient_count as usize) < MAX_RECIPIENTS,
             VestingError::RecipientListFull
         );
 
         // Reject duplicates vs existing list.
-        for e in recipients.entries.iter() {
+        for e in recipients.entries.iter().take(st.recipient_count as usize) {
             if e.wallet == input.wallet {
                 return Err(VestingError::DuplicateRecipient.into());
             }
@@ -46,21 +46,25 @@ pub fn add_recipients(
             .checked_add(remainder)
             .ok_or(VestingError::MathOverflow)?;
 
-        recipients.entries.push(RecipientEntry {
+        let idx = st.recipient_count as usize;
+        recipients.entries[idx] = RecipientEntry {
             wallet: input.wallet,
             allocation: input.allocation,
             released_amount: 0,
-            revoked: false,
+            revoked: 0,
+            _padding: [0u8; 7],
             monthly_amount,
             final_amount,
-        });
+        };
+        st.recipient_count = st
+            .recipient_count
+            .checked_add(1)
+            .ok_or(VestingError::MathOverflow)?;
         added = added.checked_add(1).ok_or(VestingError::MathOverflow)?;
     }
 
-    st.recipient_count = recipients.entries.len() as u8;
-
     // Enforce allocation sum does not exceed total supply at any point.
-    let sum = allocations_sum_u128(&recipients.entries)?;
+    let sum = allocations_sum_u128(&recipients.entries, st.recipient_count)?;
     require!(
         sum <= st.total_supply as u128,
         VestingError::AllocationSumExceedsTotalSupply
@@ -88,9 +92,9 @@ pub fn add_recipients(
     Ok(())
 }
 
-fn allocations_sum_u128(entries: &[RecipientEntry]) -> Result<u128> {
+fn allocations_sum_u128(entries: &[RecipientEntry], count: u8) -> Result<u128> {
     let mut sum: u128 = 0;
-    for e in entries {
+    for e in entries.iter().take(count as usize) {
         sum = sum
             .checked_add(e.allocation as u128)
             .ok_or(VestingError::MathOverflow)?;
@@ -108,7 +112,7 @@ pub struct AddRecipients<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Account<'info, Recipients>,
+    pub recipients: Box<Account<'info, Recipients>>,
 
     #[account(mut)]
     pub admin: Signer<'info>,

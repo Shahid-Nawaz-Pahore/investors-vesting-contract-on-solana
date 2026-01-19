@@ -16,8 +16,9 @@ pub fn sweep_dust_after_end(ctx: Context<SweepDustAfterEnd>) -> Result<()> {
     );
 
     // Disallow sweeping if any non-revoked recipient has not received full allocation.
-    for e in ctx.accounts.recipients.entries.iter() {
-        if !e.revoked && e.released_amount != e.allocation {
+    let recipients = &ctx.accounts.recipients;
+    for e in recipients.entries.iter().take(st.recipient_count as usize) {
+        if e.revoked == 0 && e.released_amount != e.allocation {
             return Err(VestingError::SweepNotAllowedOutstanding.into());
         }
     }
@@ -74,7 +75,7 @@ pub struct SweepDustAfterEnd<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Account<'info, Recipients>,
+    pub recipients: Box<Account<'info, Recipients>>,
 
     #[account(
         mut,

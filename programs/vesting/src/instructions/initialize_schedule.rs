@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 
-use crate::constants::{DURATION_MONTHS, MAX_RECIPIENTS};
+use crate::constants::DURATION_MONTHS;
 use crate::error::VestingError;
 use crate::state::{Recipients, ScheduleState};
 
@@ -50,8 +50,7 @@ pub fn initialize_schedule(
     st.sealed = false;
 
     // Initialize recipients list as empty (deterministic input order).
-    let recipients = &mut ctx.accounts.recipients;
-    recipients.entries = Vec::with_capacity(MAX_RECIPIENTS);
+    // Recipients account is already zero-initialized on creation; no manual fill required.
 
     emit!(ScheduleInitialized {
         mint: st.mint,
@@ -78,11 +77,11 @@ pub struct InitializeSchedule<'info> {
     #[account(
         init,
         payer = admin,
-        space = Recipients::space(MAX_RECIPIENTS),
+        space = Recipients::space(),
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Account<'info, Recipients>,
+    pub recipients: Box<Account<'info, Recipients>>,
 
     #[account(
         init,
