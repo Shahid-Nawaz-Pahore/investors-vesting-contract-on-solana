@@ -336,6 +336,30 @@ describe("vesting (spec-authoritative)", () => {
     expect(b1.getTime()).to.equal(new Date(Date.UTC(2024, 1, 29, 0, 0, 0)).getTime());
   });
 
+  it("calendar month boundaries for 2026-04-11 (explicit schedule dates)", async () => {
+    // Explicit schedule dates requested: 04/11/2026 ... 03/11/2027 (UTC midnight).
+    const start = new Date(Date.UTC(2026, 3, 11, 0, 0, 0)); // 2026-04-11
+    const expected = [
+      "2026-04-11T00:00:00.000Z",
+      "2026-05-11T00:00:00.000Z",
+      "2026-06-11T00:00:00.000Z",
+      "2026-07-11T00:00:00.000Z",
+      "2026-08-11T00:00:00.000Z",
+      "2026-09-11T00:00:00.000Z",
+      "2026-10-11T00:00:00.000Z",
+      "2026-11-11T00:00:00.000Z",
+      "2026-12-11T00:00:00.000Z",
+      "2027-01-11T00:00:00.000Z",
+      "2027-02-11T00:00:00.000Z",
+      "2027-03-11T00:00:00.000Z",
+    ];
+    const actual = [];
+    for (let k = 0; k < expected.length; k++) {
+      actual.push(addMonthsClampedUtc(start, k).toISOString());
+    }
+    expect(actual).to.deep.equal(expected);
+  });
+
   it("initialize_schedule validation matrix", async () => {
     const nowTs = await currentUnixTs(connection);
     const startTsOk = new BN(nowTs + 60);
@@ -891,6 +915,26 @@ describe("vesting (spec-authoritative)", () => {
       expect(anchorErrorCode(e)).to.equal("BeforeStart");
     }
 
+    // boundary tests: start_ts - 1 fails, start_ts succeeds (immediate eligibility)
+    if (warpSupported) {
+      await warpToUnixTs(connection, startTsNum - 1);
+      try {
+        await program.methods
+          .emitVestingQuote(r2.publicKey)
+          .accounts({ scheduleState, recipients: recipientsPda })
+          .rpc();
+        expect.fail("should have failed");
+      } catch (e: any) {
+        expect(anchorErrorCode(e)).to.equal("BeforeStart");
+      }
+
+      await warpToUnixTs(connection, startTsNum);
+      await program.methods
+        .emitVestingQuote(r2.publicKey)
+        .accounts({ scheduleState, recipients: recipientsPda })
+        .rpc();
+    }
+
     // Advance to start (immediate unlock at boundary is eligible).
     if (warpSupported) {
       await warpToUnixTs(connection, startTsNum);
@@ -930,6 +974,41 @@ describe("vesting (spec-authoritative)", () => {
         TOKEN_PROGRAM_ID
       );
       await provider.sendAndConfirm(new anchor.web3.Transaction().add(topUpIx), [admin]);
+    }
+
+    // admin_withdraw allowed mid-vesting: withdraw 1, then top-up back to keep funding invariant
+    {
+      const vaultBefore = await getAccount(connection, vaultPda);
+      const adminBefore = await getAccount(connection, adminMintAta);
+
+      await program.methods
+        .adminWithdraw(new BN(1), new BN(555))
+        .accounts({
+          scheduleState,
+          recipients: recipientsPda,
+          vault: vaultPda,
+          adminDestination: adminMintAta,
+          mint: mintKp.publicKey,
+          admin: admin.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([admin])
+        .rpc();
+
+      const vaultAfter = await getAccount(connection, vaultPda);
+      const adminAfter = await getAccount(connection, adminMintAta);
+      expect(vaultBefore.amount - vaultAfter.amount).to.equal(BigInt(1));
+      expect(adminAfter.amount - adminBefore.amount).to.equal(BigInt(1));
+
+      const restoreIx = createTransferInstruction(
+        adminMintAta,
+        vaultPda,
+        admin.publicKey,
+        BigInt(1),
+        [],
+        TOKEN_PROGRAM_ID
+      );
+      await provider.sendAndConfirm(new anchor.web3.Transaction().add(restoreIx), [admin]);
     }
 
     // deposit after start must fail
@@ -1075,7 +1154,7 @@ describe("vesting (spec-authoritative)", () => {
     const expectedMonthly = BigInt(allocs[0].div(new BN(12)).toString());
     expect(after1.amount - before1.amount).to.equal(expectedMonthly);
 
-    // idempotency: re-call should no-op
+    // idempotency: re-call should no-op (same month / same block behavior)
     const beforeAgain = await getAccount(connection, atas[0]);
     await program.methods
       .releaseToRecipient(r1.publicKey)
@@ -1142,6 +1221,55 @@ describe("vesting (spec-authoritative)", () => {
       .rpc();
     const after3m = await getAccount(connection, atas[2]);
     expect(after3m.amount > before3m.amount).to.equal(true);
+
+    // catch-up behavior: skip a month, then release and expect cumulative amount
+    if (warpSupported) {
+      const startDate = new Date(startTsNum * 1000);
+      const juneBoundary = Math.floor(addMonthsClampedUtc(startDate, 2).getTime() / 1000);
+
+      // skip May (no release), call in June for r6
+      await warpToUnixTs(connection, juneBoundary);
+      const beforeCatch = await getAccount(connection, atas[5]);
+      await program.methods
+        .releaseToRecipient(r6.publicKey)
+        .accounts({
+          scheduleState,
+          recipients: recipientsPda,
+          vault: vaultPda,
+          recipientAta: atas[5],
+          mint: mintKp.publicKey,
+          distributor: distributor.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([distributor])
+        .rpc();
+      const afterCatch = await getAccount(connection, atas[5]);
+      const r6Monthly = BigInt(allocs[5].div(new BN(12)).toString());
+      expect(afterCatch.amount - beforeCatch.amount).to.equal(r6Monthly * BigInt(3));
+    }
+
+    // dust policy: remainder paid in final month (r6 has a remainder)
+    if (warpSupported) {
+      const startDate = new Date(startTsNum * 1000);
+      const lastBoundary = Math.floor(addMonthsClampedUtc(startDate, 11).getTime() / 1000);
+      await warpToUnixTs(connection, lastBoundary);
+      await program.methods
+        .releaseToRecipient(r6.publicKey)
+        .accounts({
+          scheduleState,
+          recipients: recipientsPda,
+          vault: vaultPda,
+          recipientAta: atas[5],
+          mint: mintKp.publicKey,
+          distributor: distributor.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([distributor])
+        .rpc();
+      const afterDust = await getAccount(connection, atas[5]);
+      const r6Allocation = BigInt(allocs[5].toString());
+      expect(afterDust.amount).to.equal(r6Allocation);
+    }
 
     // batch size > 5 rejected
     try {
@@ -1321,6 +1449,55 @@ describe("vesting (spec-authoritative)", () => {
       expect.fail("should have failed");
     } catch (e: any) {
       expect(anchorErrorCode(e)).to.equal("SweepBeforeEnd");
+    }
+
+    // admin_withdraw: unauthorized admin rejected
+    try {
+      await program.methods
+        .adminWithdraw(new BN(1), new BN(42))
+        .accounts({
+          scheduleState,
+          recipients: recipientsPda,
+          vault: vaultPda,
+          adminDestination: adminMintAta,
+          mint: mintKp.publicKey,
+          admin: distributor.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([distributor])
+        .rpc();
+      expect.fail("should have failed");
+    } catch (e: any) {
+      expect(anchorErrorCode(e)).to.equal("UnauthorizedAdmin");
+    }
+
+    // admin_withdraw: after end, admin can withdraw remaining (revoked) balance
+    if (warpSupported) {
+      const startDate = new Date(startTsNum * 1000);
+      const endBoundary = Math.floor(addMonthsClampedUtc(startDate, 12).getTime() / 1000);
+      await warpToUnixTs(connection, endBoundary);
+
+      const vaultBefore = await getAccount(connection, vaultPda);
+      const adminBefore = await getAccount(connection, adminMintAta);
+
+      await program.methods
+        .adminWithdraw(new BN(vaultBefore.amount.toString()), new BN(77))
+        .accounts({
+          scheduleState,
+          recipients: recipientsPda,
+          vault: vaultPda,
+          adminDestination: adminMintAta,
+          mint: mintKp.publicKey,
+          admin: admin.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([admin])
+        .rpc();
+
+      const vaultAfter = await getAccount(connection, vaultPda);
+      const adminAfter = await getAccount(connection, adminMintAta);
+      expect(vaultAfter.amount).to.equal(BigInt(0));
+      expect(adminAfter.amount - adminBefore.amount).to.equal(vaultBefore.amount);
     }
 
     // NOTE: Full end-to-end "after 12 calendar months" scenarios (sweep-after-end success, exact

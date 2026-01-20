@@ -11,8 +11,8 @@ pub use error::*;
 pub use state::*;
 // Avoid glob re-exports to prevent ambiguous names with #[program] entrypoints.
 pub use instructions::{
-    AddRecipients, BatchRelease, DepositTokens, EmitVestingQuote, InitializeSchedule, Pause,
-    ReleaseToRecipient, RevokeRecipient, SetDistributor, SweepDustAfterEnd, Unpause,
+    AddRecipients, AdminWithdraw, BatchRelease, DepositTokens, EmitVestingQuote, InitializeSchedule,
+    Pause, ReleaseToRecipient, RevokeRecipient, SetDistributor, SweepDustAfterEnd, Unpause,
 };
 
 // Anchor's #[program] macro expects `crate::__client_accounts_*` modules.
@@ -51,8 +51,11 @@ pub mod __client_accounts_emit_vesting_quote {
 pub mod __client_accounts_sweep_dust_after_end {
     pub use crate::instructions::__client_accounts_sweep_dust_after_end::*;
 }
+pub mod __client_accounts_admin_withdraw {
+    pub use crate::instructions::__client_accounts_admin_withdraw::*;
+}
 
-declare_id!("61EiRiRNSU4ZEhnn8JpC6L9VRHz6oKvD9YzSP6bNZNWp");
+declare_id!("9C4si6Q8G6PagBnbjSaasG8aF9KPkM5TCY75pfVKCArU");
 
 #[program]
 pub mod vesting {
@@ -277,5 +280,14 @@ pub mod vesting {
     /// Sweep remaining vault dust after vesting end (admin-only).
     pub fn sweep_dust_after_end(ctx: Context<SweepDustAfterEnd>) -> Result<()> {
         instructions::sweep_dust_after_end::sweep_dust_after_end(ctx)
+    }
+
+    /// Withdraw from vault after vesting end (admin-only).
+    pub fn admin_withdraw(
+        ctx: Context<AdminWithdraw>,
+        amount: u64,
+        query_id: u64,
+    ) -> Result<()> {
+        instructions::admin_withdraw::admin_withdraw(ctx, amount, query_id)
     }
 }
