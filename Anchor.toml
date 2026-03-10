@@ -6,21 +6,19 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-vesting = "9C4si6Q8G6PagBnbjSaasG8aF9KPkM5TCY75pfVKCArU"
+vesting = "Ciakz9hmiVDhNpLAoifJ8fXsjgEQdWThs5DLngS9uAit"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-
 cluster = "devnet"
 wallet = "~/.config/solana/id.json"
-
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
 
 [test]
-# WSL and slower machines can take longer to bring up the local validator.
-# This avoids "Unable to get latest blockhash. Test validator does not look started."
 startup_wait = 60000
+shutdown_wait = 2000
+upgradeable = false

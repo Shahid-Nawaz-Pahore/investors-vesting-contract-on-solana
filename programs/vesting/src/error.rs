@@ -92,5 +92,11 @@ pub enum VestingError {
 
     #[msg("Sweep not allowed: unreleased (non-revoked) allocations remain")]
     SweepNotAllowedOutstanding,
+
+    #[msg("No tokens available to release")]
+    NothingToRelease,
+
+    #[msg("Start timestamp must be in the future")]
+    InvalidStartTime,
 }
 

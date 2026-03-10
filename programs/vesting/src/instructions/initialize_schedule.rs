@@ -4,6 +4,7 @@ use anchor_spl::token::{Mint, Token, TokenAccount};
 use crate::constants::DURATION_MONTHS;
 use crate::error::VestingError;
 use crate::state::{Recipients, ScheduleState};
+const AUTHORIZED_ADMIN: Pubkey = pubkey!("FQcUKgBwfs5NsQ6o2R72bnS7xedj3z6PKhXDaAsitPah");
 
 pub fn initialize_schedule(
     ctx: Context<InitializeSchedule>,
@@ -11,9 +12,19 @@ pub fn initialize_schedule(
     start_ts: i64,
     total_supply: u64,
 ) -> Result<()> {
+    require_keys_eq!(
+        ctx.accounts.admin.key(),
+        AUTHORIZED_ADMIN,
+        VestingError::UnauthorizedAdmin
+    );
+
+    let now = Clock::get()?.unix_timestamp;
     require!(total_supply > 0, VestingError::InvalidConfig);
-    require!(start_ts > 0, VestingError::InvalidTimestamp);
-    require!(distributor != Pubkey::default(), VestingError::InvalidPubkey);
+    require!(start_ts > now, VestingError::InvalidStartTime);
+    require!(
+        distributor != Pubkey::default(),
+        VestingError::InvalidPubkey
+    );
     require!(
         distributor != ctx.accounts.admin.key(),
         VestingError::InvalidConfig
@@ -26,14 +37,10 @@ pub fn initialize_schedule(
 
     // Spec: distributor must not be any program PDA (cannot sign). Explicitly block the known PDAs.
     let schedule_state_key = ctx.accounts.schedule_state.key();
-    let (vault_pda, _) = Pubkey::find_program_address(
-        &[b"vault", schedule_state_key.as_ref()],
-        &crate::ID,
-    );
-    let (recipients_pda, _) = Pubkey::find_program_address(
-        &[b"recipients", schedule_state_key.as_ref()],
-        &crate::ID,
-    );
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", schedule_state_key.as_ref()], &crate::ID);
+    let (recipients_pda, _) =
+        Pubkey::find_program_address(&[b"recipients", schedule_state_key.as_ref()], &crate::ID);
     require!(distributor != vault_pda, VestingError::InvalidConfig);
     require!(distributor != recipients_pda, VestingError::InvalidConfig);
 
@@ -111,5 +118,3 @@ pub struct ScheduleInitialized {
     pub start_ts: i64,
     pub total_supply: u64,
 }
-
-

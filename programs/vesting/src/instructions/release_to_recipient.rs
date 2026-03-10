@@ -71,7 +71,7 @@ pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) ->
         .checked_sub(entry.released_amount)
         .ok_or(VestingError::MathOverflow)?;
     if releasable == 0 {
-        return Ok(());
+        return Err(VestingError::NothingToRelease.into());
     }
 
     require!(
