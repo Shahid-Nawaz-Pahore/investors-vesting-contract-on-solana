@@ -63,7 +63,7 @@ pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) ->
 
     // If revoked, no-op (stop future releases).
     if entry.revoked != 0 {
-        return Ok(());
+    return Err(VestingError::RecipientRevoked.into());
     }
 
     let vested = vested_amount(entry.monthly_amount, entry.final_amount, month_idx)?;
@@ -180,5 +180,4 @@ pub struct TokensReleased {
     pub allocation: u64,
     pub released_total: u64,
 }
-
 

@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 
-use crate::constants::DURATION_MONTHS;
 use crate::error::VestingError;
 use crate::state::{Recipients, ScheduleState};
 const AUTHORIZED_ADMIN: Pubkey = pubkey!("FQcUKgBwfs5NsQ6o2R72bnS7xedj3z6PKhXDaAsitPah");
@@ -49,7 +48,6 @@ pub fn initialize_schedule(
     st.admin = ctx.accounts.admin.key();
     st.distributor = distributor;
     st.start_ts = start_ts;
-    st.duration_months = DURATION_MONTHS;
     st.paused = false;
     st.total_supply = total_supply;
     st.released_supply = 0;
