@@ -36,7 +36,15 @@ pub fn sweep_dust_after_end(ctx: Context<SweepDustAfterEnd>) -> Result<()> {
         VestingError::InvalidTokenAccount
     );
 
-    let amount = ctx.accounts.vault.amount;
+    let committed = st.total_supply
+        .checked_sub(st.released_supply)
+        .ok_or(VestingError::MathOverflow)?;
+
+    let vault_balance = ctx.accounts.vault.amount;
+    let amount = vault_balance
+        .checked_sub(committed)
+        .unwrap_or(0); 
+
     if amount == 0 {
         emit!(DustSwept {
             admin: st.admin,

@@ -12,8 +12,6 @@ pub fn add_recipients(
     let st = &mut ctx.accounts.schedule_state;
     require_keys_eq!(ctx.accounts.admin.key(), st.admin, VestingError::UnauthorizedAdmin);
     require!(!st.sealed, VestingError::RecipientsSealed);
-    require!(st.duration_months == DURATION_MONTHS, VestingError::InvalidConfig);
-
     let recipients = &mut ctx.accounts.recipients;
     let mut added: u8 = 0;
 
