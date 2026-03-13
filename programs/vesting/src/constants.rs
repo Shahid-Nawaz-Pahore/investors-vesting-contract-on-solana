@@ -1,7 +1,7 @@
 //! Program-wide constants (spec-authoritative).
 
 /// Max recipients stored on-chain in the recipients list PDA.
-pub const MAX_RECIPIENTS: usize = 35;
+pub const MAX_RECIPIENTS: usize = 30;
 
 /// Max recipients processed per `batch_release` call.
 pub const MAX_BATCH_RELEASE: usize = 5;
