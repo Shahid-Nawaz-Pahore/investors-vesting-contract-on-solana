@@ -12,7 +12,7 @@ pub fn add_recipients(
     let st = &mut ctx.accounts.schedule_state;
     require_keys_eq!(ctx.accounts.admin.key(), st.admin, VestingError::UnauthorizedAdmin);
     require!(!st.sealed, VestingError::RecipientsSealed);
-    let recipients = &mut ctx.accounts.recipients;
+let recipients = &mut ctx.accounts.recipients.load_mut()?;
     let mut added: u8 = 0;
 
     for (i, input) in inputs.iter().enumerate() {
@@ -110,7 +110,7 @@ pub struct AddRecipients<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Box<Account<'info, Recipients>>,
+    pub recipients: AccountLoader<'info, Recipients>,
 
     #[account(mut)]
     pub admin: Signer<'info>,

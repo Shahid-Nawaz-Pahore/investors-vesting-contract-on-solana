@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
+use bytemuck::{Pod, Zeroable};
 
-/// A single recipient entry stored in the recipients list PDA.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct RecipientEntry {
@@ -13,37 +13,24 @@ pub struct RecipientEntry {
     pub final_amount: u64,
 }
 
-impl Default for RecipientEntry {
-    fn default() -> Self {
-        Self {
-            wallet: Pubkey::default(),
-            allocation: 0,
-            released_amount: 0,
-            revoked: 0,
-            _padding: [0u8; 7],
-            monthly_amount: 0,
-            final_amount: 0,
-        }
-    }
-}
-
-/// PDA holding the full recipients list (<= 35 entries).
-#[account]
-#[repr(C)]
-pub struct Recipients {
-    /// Deterministic input ordering; sealed prevents reordering/mutation.
-    pub entries: [RecipientEntry; crate::constants::MAX_RECIPIENTS],
-}
-
-impl Recipients {
-    /// Space for discriminator + fixed entries array (no vec header).
-    pub const fn space() -> usize {
-        8 + core::mem::size_of::<Recipients>()
-    }
-}
+unsafe impl Pod for RecipientEntry {}
+unsafe impl Zeroable for RecipientEntry {}
 
 impl RecipientEntry {
     pub const SIZE: usize = core::mem::size_of::<RecipientEntry>();
+}
+
+/// PDA holding the full recipients list (<= 70 entries).
+#[account(zero_copy)]
+#[repr(C)]
+pub struct Recipients {
+    pub entries: [RecipientEntry; 70],
+}
+
+impl Recipients {
+    pub const fn space() -> usize {
+        8 + core::mem::size_of::<Recipients>()
+    }
 }
 
 /// Instruction input (wallet + allocation).
@@ -52,5 +39,3 @@ pub struct RecipientInput {
     pub wallet: Pubkey,
     pub allocation: u64,
 }
-
-
