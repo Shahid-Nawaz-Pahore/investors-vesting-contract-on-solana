@@ -52,7 +52,7 @@ pub mod __client_accounts_sweep_dust_after_end {
     pub use crate::instructions::__client_accounts_sweep_dust_after_end::*;
 }
 
-declare_id!("2Jp29wMTTYv4JSH95Z5CiGP3M6mXHAkoJoDMVs6JmfcC");
+declare_id!("AERFwzAEGNPDEnwpdqz2ehbhJP4FhbJV7jvKeVZQXxm");
 
 #[program]
 pub mod vesting {

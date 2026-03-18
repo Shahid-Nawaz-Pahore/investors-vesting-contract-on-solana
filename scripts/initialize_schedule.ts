@@ -13,7 +13,7 @@ dotenv.config(envPath ? { path: envPath } : undefined);
 
 const DECIMALS = 6;
 const TOTAL_SUPPLY_UI = 200_000_000; // 200M tokens
-const START_TS_UTC = "2026-03-13T10:20:00.000Z";
+const START_TS_UTC = "2026-03-18T06:50:00.000Z";
 
 function requireEnv(name: string): string {
   const v = process.env[name];

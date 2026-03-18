@@ -78,11 +78,6 @@ ACTION=pause npx ts-node scripts/pause_unpause.ts
 ACTION=unpause npx ts-node scripts/pause_unpause.ts
 ```
 
-11) **Admin withdraw**
-```
-AMOUNT=<u64> QUERY_ID=<u64> npx ts-node scripts/admin_withdraw.ts
-```
-
 ## Notes
 - Release calls before `start_ts` will fail with `BeforeStart`.
 - Missing ATAs will cause releases to fail.

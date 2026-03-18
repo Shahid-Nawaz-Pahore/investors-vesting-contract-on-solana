@@ -24,7 +24,7 @@ impl RecipientEntry {
 #[account(zero_copy)]
 #[repr(C)]
 pub struct Recipients {
-    pub entries: [RecipientEntry; 70],
+    pub entries: [RecipientEntry; 59],
 }
 
 impl Recipients {
