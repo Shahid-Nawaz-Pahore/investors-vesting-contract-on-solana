@@ -17,7 +17,7 @@ const DECIMALS = 6;
 const TOTAL_SUPPLY_UI = 200_000_000;
 const START_TS_UTC = "2026-03-18T09:30:00.000Z";
 
-const MINT = new PublicKey("eDz2jHzHy68iZzTF1kERkpDQ5ozzQ9EKWauLqmjtN4R");
+const MINT = new PublicKey("AD3yLbjtzi1UEuTooDMVc8aZga9YHi5BzTJpEJcEQtWp");
 const DISTRIBUTOR = new PublicKey("7iJdaPKi5y8r8rVeVNrGWrNMq177m2kUzvUnv8KcZSvC");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

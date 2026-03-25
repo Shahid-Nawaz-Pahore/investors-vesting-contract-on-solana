@@ -12,7 +12,7 @@ const envCandidates = [resolve(process.cwd(), ".env"), resolve(process.cwd(), "v
 const envPath = envCandidates.find((p) => existsSync(p));
 dotenv.config(envPath ? { path: envPath } : undefined);
 
-const MINT = new PublicKey("eDz2jHzHy68iZzTF1kERkpDQ5ozzQ9EKWauLqmjtN4R");
+const MINT = new PublicKey("AD3yLbjtzi1UEuTooDMVc8aZga9YHi5BzTJpEJcEQtWp");
 
 // ── PDA helpers ──────────────────────────────────────────────────────────────
 function findScheduleStatePda(programId: PublicKey): [PublicKey, number] {

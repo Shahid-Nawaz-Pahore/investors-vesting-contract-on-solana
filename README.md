@@ -1,3 +1,13 @@
+# Note:
+
+To run tests via `anchor test`, follow these steps:
+
+1. Create a new token.
+2. Create admin ATA and mint 200 million supply to admin ATA.
+3. Replace tokens address in the entire project.
+4. Before running `anchor test`, set the timer in line 26.
+
+
 # Commands
 
 ## Run tests (localnet)

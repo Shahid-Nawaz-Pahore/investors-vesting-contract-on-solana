@@ -46,3 +46,6 @@ npx ts-mocha -p ./tsconfig.json -t 1000000 tests/negative_tests_admin.test.ts
 
 export ANCHOR_WALLET=/home/shoaibmk/projects/investor_vesting_contract/distributor.json
 npx ts-mocha -p ./tsconfig.json -t 1000000 tests/negative_tests_distributor.test.ts
+
+
+
