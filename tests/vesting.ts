@@ -23,8 +23,8 @@ dotenv.config(envPath ? { path: envPath } : undefined);
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DECIMALS = 6;
 const TOTAL_SUPPLY_UI = 200_000_000;
-const START_TS_UTC = "2026-03-25T09:45:00.000Z";
-const MINT = new PublicKey("AD3yLbjtzi1UEuTooDMVc8aZga9YHi5BzTJpEJcEQtWp");
+const START_TS_UTC = "2026-03-26T05:25:00.000Z";
+const MINT = new PublicKey("ACF6FKww1NpsWbV9Hfw9GUerd3Goq53tKwQoKxKNgDyX");
 const DISTRIBUTOR = new PublicKey("7iJdaPKi5y8r8rVeVNrGWrNMq177m2kUzvUnv8KcZSvC");
 const REVOKE_TARGET = new PublicKey("rdr7FwfCVnRJtMKdSVqUNbqd6g9kAmb676XpFLvGiMw");
 const BATCH_SIZE = 5;

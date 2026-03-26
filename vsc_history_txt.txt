@@ -3,7 +3,7 @@
   anchor build
   anchor deploy --provider.cluster https://api.devnet.solana.com
   npx ts-node scripts/initialize_schedule.ts
-  ls /home/shoaibmk/.config/solana/id.json //admin
+  ls /home/shoaibmk/projects/investor_vesting_contract/keys/id.json 
   npx ts-node scripts/create_recipient_atas.ts
   npx ts-node scripts/add_recipients.ts
   npx ts-node scripts/deposit_tokens.ts
@@ -25,7 +25,7 @@ history > vsc_history.txt
   npx ts-node scripts/check_recipients_balances.ts
 
   
-To start again, do this first: export ANCHOR_WALLET=~/.config/solana/id.json
+To start again, do this first: export ANCHOR_WALLET=/home/shoaibmk/projects/investor_vesting_contract/keys/id.json 
 
 Unit testing:
 npx ts-mocha -p ./tsconfig.json -t 1000000 tests/Initialize_schedule.test.ts
@@ -41,7 +41,7 @@ npx ts-mocha -p ./tsconfig.json -t 1000000 tests/revoke_recipient.test.ts
 npx ts-mocha -p ./tsconfig.json -t 1000000 tests/pause_unpause.test.ts
 npx ts-mocha -p ./tsconfig.json -t 1000000 tests/sweep_dust_after_end.test.ts
 
-export ANCHOR_WALLET=~/.config/solana/id.json
+export ANCHOR_WALLET=/home/shoaibmk/projects/investor_vesting_contract/keys/id.json 
 npx ts-mocha -p ./tsconfig.json -t 1000000 tests/negative_tests_admin.test.ts
 
 export ANCHOR_WALLET=/home/shoaibmk/projects/investor_vesting_contract/distributor.json

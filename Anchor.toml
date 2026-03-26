@@ -6,14 +6,14 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-vesting = "3nz8rZhmk3u9m2gB2TbP4vg9y4KQ9Loi9u95tcd8Zdyu"
+vesting = "6ZwThBj53u1bW3vEbbofj6GNmTo1qDwCCg8N5Aa4RDrV"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
 cluster = "devnet"
-wallet = "~/.config/solana/id.json"
+wallet = "~/projects/investor_vesting_contract/keys/id.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/vesting.ts\""
