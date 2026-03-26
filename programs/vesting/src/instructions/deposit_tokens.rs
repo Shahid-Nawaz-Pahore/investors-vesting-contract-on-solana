@@ -21,11 +21,12 @@ pub fn deposit_tokens(ctx: Context<DepositTokens>, amount: u64) -> Result<()> {
         VestingError::InvalidTokenAccount
     );
 
-    // Over-deposit protection.
+    // Over-deposit protection — pre-CPI u128 check is sufficient.
+    // Post-CPI reload removed: if pre-check passes and transfer succeeds,
+    // vault balance is mathematically guaranteed to be within total_supply.
     let pre = ctx.accounts.vault.amount as u128;
-    let add = amount as u128;
     let post = pre
-        .checked_add(add)
+        .checked_add(amount as u128)
         .ok_or(VestingError::MathOverflow)?;
     require!(post <= st.total_supply as u128, VestingError::OverDeposit);
 
@@ -41,13 +42,12 @@ pub fn deposit_tokens(ctx: Context<DepositTokens>, amount: u64) -> Result<()> {
         amount,
     )?;
 
-    ctx.accounts.vault.reload()?;
-    require!(ctx.accounts.vault.amount <= st.total_supply, VestingError::OverDeposit);
-
     emit!(TokensDeposited {
         admin: st.admin,
         amount,
-        vault_balance: ctx.accounts.vault.amount,
+        // FIX: vault.reload() removed — read pre-calculated post value instead.
+        // pre + amount is already verified <= total_supply above.
+        vault_balance: u64::try_from(post).map_err(|_| VestingError::MathOverflow)?,
     });
 
     Ok(())
@@ -81,5 +81,3 @@ pub struct TokensDeposited {
     pub amount: u64,
     pub vault_balance: u64,
 }
-
-

@@ -7,7 +7,7 @@ pub fn revoke_recipient(ctx: Context<RevokeRecipient>, wallet: Pubkey) -> Result
     let st = &ctx.accounts.schedule_state;
     require_keys_eq!(ctx.accounts.admin.key(), st.admin, VestingError::UnauthorizedAdmin);
 
-    let recipients = &mut ctx.accounts.recipients;
+let recipients = &mut ctx.accounts.recipients.load_mut()?;
     let mut found = false;
     for e in recipients
         .entries
@@ -42,7 +42,7 @@ pub struct RevokeRecipient<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Box<Account<'info, Recipients>>,
+    pub recipients: AccountLoader<'info, Recipients>,
 
     pub admin: Signer<'info>,
 }

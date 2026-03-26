@@ -10,7 +10,7 @@ pub fn emit_vesting_quote(ctx: Context<EmitVestingQuote>, wallet: Pubkey) -> Res
     let now = Clock::get()?.unix_timestamp;
     let month_idx = time::month_index(now, st.start_ts)?;
 
-    let recipients = &ctx.accounts.recipients;
+    let recipients = ctx.accounts.recipients.load()?;
     let entry = recipients
         .entries
         .iter()
@@ -60,7 +60,7 @@ pub struct EmitVestingQuote<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Box<Account<'info, Recipients>>,
+    pub recipients: AccountLoader<'info, Recipients>,
 }
 
 #[event]

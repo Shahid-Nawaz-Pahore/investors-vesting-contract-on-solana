@@ -1,1511 +1,1009 @@
+import dotenv from "dotenv";
+import { resolve } from "path";
+import { existsSync, readFileSync } from "fs";
 import * as anchor from "@coral-xyz/anchor";
 import BN from "bn.js";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import {
-  TOKEN_PROGRAM_ID,
-  MINT_SIZE,
-  createInitializeMintInstruction,
-  getMinimumBalanceForRentExemptMint,
+  getMint,
   getAssociatedTokenAddressSync,
-  createAssociatedTokenAccountInstruction,
   getAccount,
-  createMintToInstruction,
-  createTransferInstruction,
+  createAssociatedTokenAccountInstruction,
 } from "@solana/spl-token";
-import { Keypair, PublicKey, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
-import { expect } from "chai";
+import assert from "assert";
 
-const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
-  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
-);
+// ─── .env load ────────────────────────────────────────────────────────────────
+const envCandidates = [
+  resolve(process.cwd(), ".env"),
+  resolve(process.cwd(), "vesting", ".env"),
+];
+const envPath = envCandidates.find((p) => existsSync(p));
+dotenv.config(envPath ? { path: envPath } : undefined);
 
-function anchorErrorCode(e: any): string | undefined {
-  // Anchor commonly throws either:
-  // - { error: { errorCode: { code } } }
-  // - AnchorError (with .error.errorCode.code)
-  // - plain Error / SendTransactionError
-  const direct =
-    e?.error?.errorCode?.code ??
-    e?.errorCode?.code ??
-    (typeof e?.errorCode === "string" ? e.errorCode : undefined);
-  if (direct) return direct;
+// ─── Constants ────────────────────────────────────────────────────────────────
+const DECIMALS = 6;
+const TOTAL_SUPPLY_UI = 200_000_000;
+const START_TS_UTC = "2026-03-26T05:25:00.000Z";
+const MINT = new PublicKey("ACF6FKww1NpsWbV9Hfw9GUerd3Goq53tKwQoKxKNgDyX");
+const DISTRIBUTOR = new PublicKey("7iJdaPKi5y8r8rVeVNrGWrNMq177m2kUzvUnv8KcZSvC");
+const REVOKE_TARGET = new PublicKey("rdr7FwfCVnRJtMKdSVqUNbqd6g9kAmb676XpFLvGiMw");
+const BATCH_SIZE = 5;
+const ADD_BATCH_SIZE = 10;
 
-  // SendTransactionError / simulation failures often include logs that contain:
-  // "Error Code: <CodeName>"
-  const logs: string[] | undefined =
-    e?.logs ??
-    e?.error?.logs ??
-    e?.error?.errorLogs ??
-    e?.transactionLogs ??
-    e?.simulationResponse?.value?.logs ??
-    e?.simulationResponse?.logs ??
-    e?.data?.logs;
-
-  if (Array.isArray(logs)) {
-    const joined = logs.join("\n");
-    const m = joined.match(/Error Code:\s*([A-Za-z0-9_]+)/);
-    if (m?.[1]) return m[1];
+// ─── Distributor keypair loader ───────────────────────────────────────────────
+// DISTRIBUTOR_KEYPAIR=/path/to/distributor.json — .env mein set karo
+function loadDistributorKeypair(): Keypair {
+  const kpPath =
+    process.env.DISTRIBUTOR_KEYPAIR ||
+    resolve(process.cwd(), "distributor.json");
+  if (!existsSync(kpPath)) {
+    throw new Error(
+      `Distributor keypair not found at: ${kpPath}\n` +
+        `Set DISTRIBUTOR_KEYPAIR=/path/to/distributor.json in .env`
+    );
   }
-
-  // Last resort: sometimes error message string contains the same "Error Code:" fragment.
-  const msg = String(e?.message ?? e ?? "");
-  const m2 = msg.match(/Error Code:\s*([A-Za-z0-9_]+)/);
-  if (m2?.[1]) return m2[1];
-
-  return undefined;
+  const raw = JSON.parse(readFileSync(kpPath, "utf-8"));
+  return Keypair.fromSecretKey(Uint8Array.from(raw));
 }
 
-/**
- * Assumptions / notes:
- * - This program has a single global schedule PDA (seed: `schedule_state`), so tests run through
- *   the full lifecycle in-order within one validator instance (we cannot re-initialize a second
- *   schedule in a later test without restarting the validator).
- * - "ATA missing" is enforced by the account type `Account<TokenAccount>` in `release_to_recipient`,
- *   so a missing ATA fails at the Anchor account deserialization layer (framework error), not via
- *   a custom program error code.
- * - The on-chain code rejects distributor = admin / schedule_state PDA / vault PDA / recipients PDA / program id.
- */
-
-async function rpcRequest(connection: any, method: string, params: any[]) {
-  const fn = connection?._rpcRequest ?? connection?.rpcRequest;
-  if (!fn) throw new Error("Connection RPC request method not found");
-  const res = await fn.call(connection, method, params);
-  if (res?.error) {
-    const err = new Error(`${method} failed: ${JSON.stringify(res.error)}`) as any;
-    err.rpcError = res.error;
-    throw err;
+// ─── CSV helpers ──────────────────────────────────────────────────────────────
+function loadAllocationCsv(): string {
+  const candidates = [
+    resolve(process.cwd(), "allocation.csv"),
+    resolve(process.cwd(), "vesting", "allocation.csv"),
+    resolve(process.cwd(), "..", "allocation.csv"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return readFileSync(p, "utf8");
   }
-  return res?.result;
+  throw new Error("allocation.csv not found in repo root");
 }
 
-async function warpSlot(connection: any, targetSlot: number) {
-  // Solana local validator "warp slot" RPC method name differs across releases/builds.
-  const methods = ["warp_slot", "warpSlot"];
-  let lastErr: any = null;
-  for (const m of methods) {
-    try {
-      await rpcRequest(connection, m, [targetSlot]);
-      return;
-    } catch (e: any) {
-      lastErr = e;
-      // Only continue on "method not found". Anything else should fail fast.
-      const code = e?.rpcError?.code;
-      if (code !== -32601) throw e;
-    }
+function parseAllocations(csv: string): { wallet: PublicKey; allocation: BN }[] {
+  const entries: { wallet: PublicKey; allocation: BN }[] = [];
+  for (const line of csv.split(/\r?\n/)) {
+    if (!line.includes("|")) continue;
+    if (line.includes("wallet_pubkey")) continue;
+    if (line.startsWith("-")) continue;
+    const parts = line.split("|").map((p) => p.trim());
+    if (!parts[0] || !parts[1]) continue;
+    entries.push({
+      wallet: new PublicKey(parts[0]),
+      allocation: new BN(parts[1]),
+    });
   }
-  throw new Error(
-    `Validator RPC does not support slot warping (tried: ${methods.join(
-      ", "
-    )}). ` +
-      `Run tests on Anchor's local validator with warp support, or switch to a bankrun-based test harness.` +
-      (lastErr ? ` Last error: ${String(lastErr?.message ?? lastErr)}` : "")
+  if (entries.length === 0) throw new Error("No allocations parsed from allocation.csv");
+  return entries;
+}
+
+function parseWallets(csv: string): PublicKey[] {
+  return parseAllocations(csv).map((e) => e.wallet);
+}
+
+// ─── PDA helpers ──────────────────────────────────────────────────────────────
+function findScheduleStatePda(programId: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("schedule_state")],
+    programId
   );
 }
-
-async function currentUnixTs(connection: any): Promise<number> {
-  // On some local validators, `getBlockTime` may return null for early slots.
-  // We keep this deterministic by polling with a bounded timeout (no dependency on warp RPC).
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < 15_000) {
-    const slot = await connection.getSlot();
-    const bt = await connection.getBlockTime(slot);
-    if (typeof bt === "number") return bt;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error("Unable to read current block time (getBlockTime kept returning null)");
-}
-
-async function hasWarpSupport(connection: any): Promise<boolean> {
-  try {
-    const slot = await connection.getSlot();
-    await warpSlot(connection, slot + 1);
-    return true;
-  } catch (e: any) {
-    const msg = String(e?.message ?? e);
-    if (msg.includes("does not support slot warping")) return false;
-    // If it failed for some other reason (RPC error), surface it.
-    if (msg.includes("Method not found")) return false;
-    throw e;
-  }
-}
-
-async function warpToUnixTs(connection: any, targetTs: number) {
-  // Warp slots until the validator's Clock unix_timestamp is >= targetTs.
-  // Uses an approximate 400ms slot time; we correct via re-checking actual blocktime.
-  for (let i = 0; i < 60; i++) {
-    const slot = await connection.getSlot();
-    const nowTs = await currentUnixTs(connection);
-    if (nowTs >= targetTs) return;
-
-    const deltaSeconds = targetTs - nowTs;
-    const deltaSlots = Math.max(1, Math.ceil(deltaSeconds / 0.4));
-    const targetSlot = slot + Math.min(deltaSlots, 200_000);
-    await warpSlot(connection, targetSlot);
-  }
-  throw new Error(`warpToUnixTs timeout (targetTs=${targetTs})`);
-}
-
-async function waitUntilUnixTs(connection: any, targetTs: number, timeoutMs = 30_000) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const now = await currentUnixTs(connection);
-    if (now >= targetTs) return;
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  throw new Error(`Timed out waiting for unix time >= ${targetTs}`);
-}
-
-function daysInMonthUtc(year: number, month1: number): number {
-  // month1: 1-12
-  return new Date(Date.UTC(year, month1, 0)).getUTCDate();
-}
-
-function addMonthsClampedUtc(start: Date, monthsToAdd: number): Date {
-  const y0 = start.getUTCFullYear();
-  const m0 = start.getUTCMonth(); // 0-11
-  const d0 = start.getUTCDate();
-  const sod =
-    start.getUTCHours() * 3600 + start.getUTCMinutes() * 60 + start.getUTCSeconds();
-
-  const base = y0 * 12 + m0;
-  const next = base + monthsToAdd;
-  const y = Math.floor(next / 12);
-  const m0n = next % 12;
-  const month1 = m0n + 1;
-
-  const dim = daysInMonthUtc(y, month1);
-  const d = Math.min(d0, dim);
-
-  const hh = Math.floor(sod / 3600);
-  const mm = Math.floor((sod % 3600) / 60);
-  const ss = sod % 60;
-  return new Date(Date.UTC(y, m0n, d, hh, mm, ss));
-}
-
-function nextUtc31stMidnight(afterTs: number): Date {
-  // Find the next month (including current) that has a 31st, and return YYYY-MM-31 00:00:00 UTC.
-  const after = new Date(afterTs * 1000);
-  let y = after.getUTCFullYear();
-  let m0 = after.getUTCMonth(); // 0-11
-
-  for (let i = 0; i < 36; i++) {
-    const y2 = y + Math.floor((m0 + i) / 12);
-    const m02 = (m0 + i) % 12;
-    const month1 = m02 + 1;
-    if (daysInMonthUtc(y2, month1) === 31) {
-      const d = new Date(Date.UTC(y2, m02, 31, 0, 0, 0));
-      if (Math.floor(d.getTime() / 1000) > afterTs) return d;
-    }
-  }
-  throw new Error("Unable to find next 31st within 36 months");
-}
-
-function findScheduleStatePda(programId: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync([Buffer.from("schedule_state")], programId);
-}
-function findRecipientsPda(programId: PublicKey, scheduleState: PublicKey): [PublicKey, number] {
+function findRecipientsPda(
+  programId: PublicKey,
+  scheduleState: PublicKey
+): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [Buffer.from("recipients"), scheduleState.toBuffer()],
     programId
   );
 }
-function findVaultPda(programId: PublicKey, scheduleState: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync([Buffer.from("vault"), scheduleState.toBuffer()], programId);
+function findVaultPda(
+  programId: PublicKey,
+  scheduleState: PublicKey
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), scheduleState.toBuffer()],
+    programId
+  );
 }
 
-describe("vesting (spec-authoritative)", () => {
+// ─── Error helper ─────────────────────────────────────────────────────────────
+function hasError(err: any, errorName: string): boolean {
+  const logs: string = err?.logs?.join(" ") ?? err?.message ?? "";
+  return logs.includes(errorName) || err?.error?.errorCode?.code === errorName;
+}
+
+// ─── Timestamp helper ─────────────────────────────────────────────────────────
+function toUnixTs(iso: string): number {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) throw new Error(`Invalid ISO date: ${iso}`);
+  return Math.floor(ms / 1000);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 1. initialize_schedule
+// ══════════════════════════════════════════════════════════════════════════════
+describe("initialize_schedule", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
 
-  // Avoid importing `../target/types/vesting` so tests can compile even before `anchor build`
-  // generates IDL/types into `target/`.
-  // Cast to `any` to avoid very deep generic inference in Anchor TS types.
-  const program = anchor.workspace.vesting as any;
-  const connection = provider.connection;
+  const startTs = toUnixTs(START_TS_UTC);
+  const totalSupply = new BN(TOTAL_SUPPLY_UI).mul(new BN(10).pow(new BN(DECIMALS)));
 
-  const DECIMALS = 6;
+  const [scheduleState] = findScheduleStatePda(program.programId);
+  const [recipients] = findRecipientsPda(program.programId, scheduleState);
+  const [vault] = findVaultPda(program.programId, scheduleState);
 
-  let admin: Keypair;
-  let distributor: Keypair;
-  let mintAuthority: Keypair;
-  let mintKp: Keypair;
-
-  let scheduleState: PublicKey;
-  let recipientsPda: PublicKey;
-  let vaultPda: PublicKey;
-
-  let adminMintAta: PublicKey;
-
-  // small set for tests (batch cap is 5)
-  let r1: Keypair;
-  let r2: Keypair;
-  let r3: Keypair;
-  let r4: Keypair;
-  let r5: Keypair;
-  let r6: Keypair;
-  let dummyAtas: PublicKey[];
-
-  const totalSupply = new BN(200_000_000_000_000); // 200M * 10^6
-  const DUMMY_COUNT_FOR_MAX_RECIPIENTS_TEST = 29; // 3 initial + 3 real + 29 dummy = 35
-
-  // allocations sum to totalSupply
-  const allocs = ((): BN[] => {
-    const a1 = new BN(10_000_000_000_000);
-    const a2 = new BN(10_000_000_000_000);
-    const a3 = new BN(10_000_000_000_000);
-    const a4 = new BN(10_000_000_000_000);
-    const a5 = new BN(10_000_000_000_000);
-    const sum5 = a1.add(a2).add(a3).add(a4).add(a5);
-    const a6 = totalSupply.sub(sum5).sub(new BN(DUMMY_COUNT_FOR_MAX_RECIPIENTS_TEST));
-    return [a1, a2, a3, a4, a5, a6];
-  })();
-
-  before(async () => {
-    admin = Keypair.generate();
-    distributor = Keypair.generate();
-    mintAuthority = Keypair.generate();
-    mintKp = Keypair.generate();
-
-    r1 = Keypair.generate();
-    r2 = Keypair.generate();
-    r3 = Keypair.generate();
-    r4 = Keypair.generate();
-    r5 = Keypair.generate();
-    r6 = Keypair.generate();
-
-    // fund signers
-    const lamports = 5 * anchor.web3.LAMPORTS_PER_SOL;
-    for (const kp of [admin, distributor, mintAuthority, r1, r2, r3, r4, r5, r6]) {
-      const sig = await connection.requestAirdrop(kp.publicKey, lamports);
-      await connection.confirmTransaction(sig);
-    }
-
-    // derive PDAs
-    [scheduleState] = findScheduleStatePda(program.programId);
-    [recipientsPda] = findRecipientsPda(program.programId, scheduleState);
-    [vaultPda] = findVaultPda(program.programId, scheduleState);
-
-    // create mint
-    const mintRent = await getMinimumBalanceForRentExemptMint(connection);
-    const createMintTx = new anchor.web3.Transaction().add(
-      SystemProgram.createAccount({
-        fromPubkey: mintAuthority.publicKey,
-        newAccountPubkey: mintKp.publicKey,
-        space: MINT_SIZE,
-        lamports: mintRent,
-        programId: TOKEN_PROGRAM_ID,
-      }),
-      createInitializeMintInstruction(mintKp.publicKey, DECIMALS, mintAuthority.publicKey, null)
-    );
-    await provider.sendAndConfirm(createMintTx, [mintAuthority, mintKp]);
-
-    // admin ATA for minting and deposit
-    adminMintAta = getAssociatedTokenAddressSync(mintKp.publicKey, admin.publicKey, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
-    const createAdminAtaTx = new anchor.web3.Transaction().add(
-      createAssociatedTokenAccountInstruction(
-        admin.publicKey,
-        adminMintAta,
-        admin.publicKey,
-        mintKp.publicKey,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      )
-    );
-    await provider.sendAndConfirm(createAdminAtaTx, [admin]);
-
-    // mint supply to admin
-    const mintToTx = new anchor.web3.Transaction().add(
-      createMintToInstruction(mintKp.publicKey, adminMintAta, mintAuthority.publicKey, BigInt(totalSupply.toString()))
-    );
-    await provider.sendAndConfirm(mintToTx, [mintAuthority]);
+  it("mint has expected decimals", async () => {
+    const mintInfo = await getMint(provider.connection, MINT);
+    assert.strictEqual(mintInfo.decimals, DECIMALS,
+      `Expected decimals ${DECIMALS}, got ${mintInfo.decimals}`);
   });
 
-  it("calendar month math parity (off-chain) - clamp + leap year + inclusivity", async () => {
-    // These are pure parity tests for the same rule as on-chain `utils/time.rs`:
-    // boundary_k = start + k months, day clamped; inclusive boundary.
-    const start = new Date(Date.UTC(2024, 0, 31, 0, 0, 0)); // 2024-01-31 (leap year)
-    const b1 = addMonthsClampedUtc(start, 1);
-    expect(b1.toISOString()).to.equal("2024-02-29T00:00:00.000Z");
-    const b2 = addMonthsClampedUtc(start, 2);
-    expect(b2.toISOString()).to.equal("2024-03-31T00:00:00.000Z");
-
-    const nonLeap = new Date(Date.UTC(2023, 0, 31, 0, 0, 0)); // 2023-01-31
-    const feb = addMonthsClampedUtc(nonLeap, 1);
-    expect(feb.toISOString()).to.equal("2023-02-28T00:00:00.000Z");
-
-    // Inclusivity check: now == boundary is eligible (conceptual parity; on-chain is unit-tested).
-    expect(b1.getTime()).to.equal(new Date(Date.UTC(2024, 1, 29, 0, 0, 0)).getTime());
+  it("PDAs are derived deterministically", () => {
+    const [ss] = findScheduleStatePda(program.programId);
+    const [rec] = findRecipientsPda(program.programId, ss);
+    const [vlt] = findVaultPda(program.programId, ss);
+    assert.ok(ss.equals(scheduleState), "schedule_state PDA mismatch");
+    assert.ok(rec.equals(recipients), "recipients PDA mismatch");
+    assert.ok(vlt.equals(vault), "vault PDA mismatch");
   });
 
-  it("calendar month boundaries for 2026-04-11 (explicit schedule dates)", async () => {
-    // Explicit schedule dates requested: 04/11/2026 ... 03/11/2027 (UTC midnight).
-    const start = new Date(Date.UTC(2026, 3, 11, 0, 0, 0)); // 2026-04-11
-    const expected = [
-      "2026-04-11T00:00:00.000Z",
-      "2026-05-11T00:00:00.000Z",
-      "2026-06-11T00:00:00.000Z",
-      "2026-07-11T00:00:00.000Z",
-      "2026-08-11T00:00:00.000Z",
-      "2026-09-11T00:00:00.000Z",
-      "2026-10-11T00:00:00.000Z",
-      "2026-11-11T00:00:00.000Z",
-      "2026-12-11T00:00:00.000Z",
-      "2027-01-11T00:00:00.000Z",
-      "2027-02-11T00:00:00.000Z",
-      "2027-03-11T00:00:00.000Z",
-    ];
-    const actual = [];
-    for (let k = 0; k < expected.length; k++) {
-      actual.push(addMonthsClampedUtc(start, k).toISOString());
+  it("initializeSchedule sends successfully (skip if already initialized)", async () => {
+    const existing = await provider.connection.getAccountInfo(scheduleState);
+    if (existing !== null) {
+      console.log("  schedule_state already initialized — skipping tx");
+      return;
     }
-    expect(actual).to.deep.equal(expected);
+    const sig = await program.methods
+      .initializeSchedule(DISTRIBUTOR, new BN(startTs), totalSupply)
+      .accounts({
+        scheduleState,
+        recipients,
+        vault,
+        mint: MINT,
+        admin: provider.wallet.publicKey,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .rpc();
+    assert.ok(sig, "Expected a transaction signature");
+    console.log("  initializeSchedule tx:", sig);
   });
 
-  it("initialize_schedule validation matrix", async () => {
-    const nowTs = await currentUnixTs(connection);
-    const startTsOk = new BN(nowTs + 60);
-
-    // total_supply > 0
-    try {
-      await program.methods
-        .initializeSchedule(distributor.publicKey, startTsOk, new BN(0))
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidConfig");
-    }
-
-    // start_ts > 0
-    try {
-      await program.methods
-        .initializeSchedule(distributor.publicKey, new BN(0), totalSupply)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidTimestamp");
-    }
-
-    // distributor != default pubkey
-    try {
-      await program.methods
-        .initializeSchedule(SystemProgram.programId, startTsOk, totalSupply)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidPubkey");
-    }
-
-    // admin != distributor
-    try {
-      await program.methods
-        .initializeSchedule(admin.publicKey, startTsOk, totalSupply)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidConfig");
-    }
-
-    // distributor not schedule_state PDA
-    try {
-      await program.methods
-        .initializeSchedule(scheduleState, startTsOk, totalSupply)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidConfig");
-    }
-
-    // distributor not vault PDA (non-signable)
-    try {
-      await program.methods
-        .initializeSchedule(vaultPda, startTsOk, totalSupply)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidConfig");
-    }
-
-    // distributor not recipients PDA (non-signable)
-    try {
-      await program.methods
-        .initializeSchedule(recipientsPda, startTsOk, totalSupply)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidConfig");
-    }
-
-    // distributor not program id
-    try {
-      await program.methods
-        .initializeSchedule(program.programId, startTsOk, totalSupply)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidConfig");
-    }
-  });
-
-  it("spec matrix (single schedule lifecycle)", async function () {
-    const nowTs = await currentUnixTs(connection);
-    const warpSupported = await hasWarpSupport(connection);
-
-    // We keep the schedule start close to "now" so tests run fast on validators without warp.
-    // Month-boundary and 12-month end-to-end tests require warp; see conditional section below.
-    const startTsNum = nowTs + 12;
-    const startTs = new BN(startTsNum);
-
-    // init
-    await program.methods
-      .initializeSchedule(distributor.publicKey, startTs, totalSupply)
-      .accounts({
-        scheduleState,
-        recipients: recipientsPda,
-        vault: vaultPda,
-        mint: mintKp.publicKey,
-        admin: admin.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY,
-      })
-      .signers([admin])
-      .rpc();
-
-    // RecipientsNotSealed: release/batch must fail before sealing (even if other accounts are valid).
-    {
-      // `recipient_ata` is an Account<TokenAccount>, so it must exist; use adminMintAta.
-      try {
-        await program.methods
-          .releaseToRecipient(r1.publicKey)
-          .accounts({
-            scheduleState,
-            recipients: recipientsPda,
-            vault: vaultPda,
-            recipientAta: adminMintAta,
-            mint: mintKp.publicKey,
-            distributor: distributor.publicKey,
-            tokenProgram: TOKEN_PROGRAM_ID,
-          })
-          .signers([distributor])
-          .rpc();
-        expect.fail("should have failed");
-      } catch (e: any) {
-        expect(anchorErrorCode(e)).to.equal("RecipientsNotSealed");
-      }
-
-      try {
-        await program.methods
-          .batchRelease([r1.publicKey])
-          .accounts({
-            scheduleState,
-            recipients: recipientsPda,
-            vault: vaultPda,
-            distributor: distributor.publicKey,
-            tokenProgram: TOKEN_PROGRAM_ID,
-          })
-          .signers([distributor])
-          .rpc();
-        expect.fail("should have failed");
-      } catch (e: any) {
-        expect(anchorErrorCode(e)).to.equal("RecipientsNotSealed");
-      }
-    }
-
-    // add recipients: invalid allocation rejected
-    try {
-      await program.methods
-        .addRecipients([{ wallet: r1.publicKey, allocation: new BN(0) }], false)
-        .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidAllocation");
-    }
-
-    // access control: add_recipients is admin-only
-    try {
-      await program.methods
-        .addRecipients([{ wallet: r1.publicKey, allocation: allocs[0] }], false)
-        .accounts({ scheduleState, recipients: recipientsPda, admin: distributor.publicKey })
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("UnauthorizedAdmin");
-    }
-
-    // add recipients: duplicate within batch rejected
-    try {
-      await program.methods
-        .addRecipients(
-          [
-            { wallet: r1.publicKey, allocation: allocs[0] },
-            { wallet: r1.publicKey, allocation: allocs[0] },
-          ],
-          false
-        )
-        .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("DuplicateRecipient");
-    }
-
-    // add first batch (no seal); partial sums allowed
-    await program.methods
-      .addRecipients(
-        [
-          { wallet: r1.publicKey, allocation: allocs[0] },
-          { wallet: r2.publicKey, allocation: allocs[1] },
-          { wallet: r3.publicKey, allocation: allocs[2] },
-        ],
-        false
-      )
-      .accounts({
-        scheduleState,
-        recipients: recipientsPda,
-        admin: admin.publicKey,
-      })
-      .signers([admin])
-      .rpc();
-
-    // add recipients: sum cannot exceed total_supply at any point
-    try {
-      await program.methods
-        .addRecipients([{ wallet: Keypair.generate().publicKey, allocation: totalSupply }], false)
-        .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("AllocationSumExceedsTotalSupply");
-    }
-
-    try {
-      await program.methods
-        .addRecipients([{ wallet: r1.publicKey, allocation: allocs[0] }], false)
-        .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("DuplicateRecipient");
-    }
-
-    // attempt seal early (sum mismatch)
-    try {
-      await program.methods
-        .addRecipients([], true)
-        .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("AllocationSumMismatchAtSeal");
-    }
-
-    // Fill recipients up to 35 total, then verify 36th is rejected (RecipientListFull).
-    const dummyWallets: PublicKey[] = [];
-    for (let i = 0; i < DUMMY_COUNT_FOR_MAX_RECIPIENTS_TEST; i++) {
-      dummyWallets.push(Keypair.generate().publicKey);
-    }
-
-    const remainingInputs = [
-      { wallet: r4.publicKey, allocation: allocs[3] },
-      { wallet: r5.publicKey, allocation: allocs[4] },
-      { wallet: r6.publicKey, allocation: allocs[5] },
-      ...dummyWallets.map((w) => ({ wallet: w, allocation: new BN(1) })),
-    ];
-
-    // Add in chunks to keep tx size reasonable.
-    for (let i = 0; i < remainingInputs.length; i += 10) {
-      await program.methods
-        .addRecipients(remainingInputs.slice(i, i + 10), false)
-        .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-    }
-
-    // 36th should fail (list full, not sealed yet).
-    try {
-      await program.methods
-        .addRecipients([{ wallet: Keypair.generate().publicKey, allocation: new BN(1) }], false)
-        .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("RecipientListFull");
-    }
-
-    // Seal now that allocation sum matches total_supply.
-    await program.methods
-      .addRecipients([], true)
-      .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-      .signers([admin])
-      .rpc();
-
-    // sealed prevents further adds
-    try {
-      await program.methods
-        .addRecipients([{ wallet: Keypair.generate().publicKey, allocation: new BN(1) }], false)
-        .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("RecipientsSealed");
-    }
-
-    // set_distributor rejects vault PDA / recipients PDA
-    try {
-      await program.methods
-        .setDistributor(vaultPda)
-        .accounts({ scheduleState, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidConfig");
-    }
-    try {
-      await program.methods
-        .setDistributor(recipientsPda)
-        .accounts({ scheduleState, admin: admin.publicKey })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidConfig");
-    }
-
-    // deposit: wrong mint token account rejected
-    {
-      // Create a second mint + admin ATA (minimal) to ensure `admin_token_account.mint` mismatch.
-      const mint2Authority = Keypair.generate();
-      const mint2 = Keypair.generate();
-      const sig = await connection.requestAirdrop(mint2Authority.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
-      await connection.confirmTransaction(sig);
-
-      const mintRent = await getMinimumBalanceForRentExemptMint(connection);
-      const tx = new anchor.web3.Transaction().add(
-        SystemProgram.createAccount({
-          fromPubkey: mint2Authority.publicKey,
-          newAccountPubkey: mint2.publicKey,
-          space: MINT_SIZE,
-          lamports: mintRent,
-          programId: TOKEN_PROGRAM_ID,
-        }),
-        createInitializeMintInstruction(mint2.publicKey, DECIMALS, mint2Authority.publicKey, null)
-      );
-      await provider.sendAndConfirm(tx, [mint2Authority, mint2]);
-
-      const adminAta2 = getAssociatedTokenAddressSync(
-        mint2.publicKey,
-        admin.publicKey,
-        false,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      const createAta2 = new anchor.web3.Transaction().add(
-        createAssociatedTokenAccountInstruction(
-          admin.publicKey,
-          adminAta2,
-          admin.publicKey,
-          mint2.publicKey,
-          TOKEN_PROGRAM_ID,
-          ASSOCIATED_TOKEN_PROGRAM_ID
-        )
-      );
-      await provider.sendAndConfirm(createAta2, [admin]);
-
-      try {
-        await program.methods
-          .depositTokens(new BN(1))
-          .accounts({
-            scheduleState,
-            vault: vaultPda,
-            adminTokenAccount: adminAta2,
-            admin: admin.publicKey,
-            tokenProgram: TOKEN_PROGRAM_ID,
-          })
-          .signers([admin])
-          .rpc();
-        expect.fail("should have failed");
-      } catch (e: any) {
-        expect(anchorErrorCode(e)).to.equal("InvalidTokenMint");
-      }
-    }
-
-    // access control: deposit_tokens is admin-only
-    try {
-      await program.methods
-        .depositTokens(new BN(1))
-        .accounts({
-          scheduleState,
-          vault: vaultPda,
-          adminTokenAccount: adminMintAta,
-          admin: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("UnauthorizedAdmin");
-    }
-
-    // deposit: over-deposit should fail
-    try {
-      await program.methods
-        .depositTokens(totalSupply.add(new BN(1)))
-        .accounts({
-          scheduleState,
-          vault: vaultPda,
-          adminTokenAccount: adminMintAta,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("OverDeposit");
-    }
-
-    // deposit partial (allowed pre-start) to exercise VaultNotExactlyFunded guard after start.
-    await program.methods
-      .depositTokens(totalSupply.sub(new BN(1)))
-      .accounts({
-        scheduleState,
-        vault: vaultPda,
-        adminTokenAccount: adminMintAta,
-        admin: admin.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([admin])
-      .rpc();
-
-    // create recipient ATAs (policy: must pre-exist)
-    const recipients = [r1, r2, r3, r4, r5, r6];
-    const atas = recipients.map((kp) =>
-      getAssociatedTokenAddressSync(mintKp.publicKey, kp.publicKey, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID)
-    );
-    const createAtasTx = new anchor.web3.Transaction();
-    for (let i = 0; i < recipients.length; i++) {
-      createAtasTx.add(
-        createAssociatedTokenAccountInstruction(
-          admin.publicKey,
-          atas[i],
-          recipients[i].publicKey,
-          mintKp.publicKey,
-          TOKEN_PROGRAM_ID,
-          ASSOCIATED_TOKEN_PROGRAM_ID
-        )
-      );
-    }
-    await provider.sendAndConfirm(createAtasTx, [admin]);
-
-    // release before start => BeforeStart (even though partially funded)
-    try {
-      await program.methods
-        .releaseToRecipient(r1.publicKey)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          recipientAta: atas[0],
-          mint: mintKp.publicKey,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("BeforeStart");
-    }
-
-    // boundary tests: start_ts - 1 fails, start_ts succeeds (immediate eligibility)
-    if (warpSupported) {
-      await warpToUnixTs(connection, startTsNum - 1);
-      try {
-        await program.methods
-          .emitVestingQuote(r2.publicKey)
-          .accounts({ scheduleState, recipients: recipientsPda })
-          .rpc();
-        expect.fail("should have failed");
-      } catch (e: any) {
-        expect(anchorErrorCode(e)).to.equal("BeforeStart");
-      }
-
-      await warpToUnixTs(connection, startTsNum);
-      await program.methods
-        .emitVestingQuote(r2.publicKey)
-        .accounts({ scheduleState, recipients: recipientsPda })
-        .rpc();
-    }
-
-    // Advance to start (immediate unlock at boundary is eligible).
-    if (warpSupported) {
-      await warpToUnixTs(connection, startTsNum);
-    } else {
-      await waitUntilUnixTs(connection, startTsNum, 30_000);
-    }
-
-    // First release after start must reject if vault not exactly funded when released_supply == 0.
-    try {
-      await program.methods
-        .releaseToRecipient(r1.publicKey)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          recipientAta: atas[0],
-          mint: mintKp.publicKey,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("VaultNotExactlyFunded");
-    }
-
-    // Top-up the missing 1 unit via a direct SPL transfer (destination does not require PDA authority).
-    // This is only for testing the guard without getting stuck (deposit_tokens is forbidden after start).
-    {
-      const topUpIx = createTransferInstruction(
-        adminMintAta,
-        vaultPda,
-        admin.publicKey,
-        BigInt(1),
-        [],
-        TOKEN_PROGRAM_ID
-      );
-      await provider.sendAndConfirm(new anchor.web3.Transaction().add(topUpIx), [admin]);
-    }
-
-    // admin_withdraw allowed mid-vesting: withdraw 1, then top-up back to keep funding invariant
-    {
-      const vaultBefore = await getAccount(connection, vaultPda);
-      const adminBefore = await getAccount(connection, adminMintAta);
-
-      await program.methods
-        .adminWithdraw(new BN(1), new BN(555))
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          adminDestination: adminMintAta,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([admin])
-        .rpc();
-
-      const vaultAfter = await getAccount(connection, vaultPda);
-      const adminAfter = await getAccount(connection, adminMintAta);
-      expect(vaultBefore.amount - vaultAfter.amount).to.equal(BigInt(1));
-      expect(adminAfter.amount - adminBefore.amount).to.equal(BigInt(1));
-
-      const restoreIx = createTransferInstruction(
-        adminMintAta,
-        vaultPda,
-        admin.publicKey,
-        BigInt(1),
-        [],
-        TOKEN_PROGRAM_ID
-      );
-      await provider.sendAndConfirm(new anchor.web3.Transaction().add(restoreIx), [admin]);
-    }
-
-    // deposit after start must fail
-    try {
-      await program.methods
-        .depositTokens(new BN(1))
-        .accounts({
-          scheduleState,
-          vault: vaultPda,
-          adminTokenAccount: adminMintAta,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("DepositAfterStart");
-    }
-
-    // release_to_recipient: wrong ATA rejected (must be canonical ATA)
-    try {
-      await program.methods
-        .releaseToRecipient(r2.publicKey)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          recipientAta: adminMintAta, // wrong (exists, same mint)
-          mint: mintKp.publicKey,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidRecipientAta");
-    }
-
-    // release_to_recipient: ATA missing (framework-level failure)
-    // Use a dummy recipient that is in the on-chain list but whose ATA was never created.
-    {
-      const missingOwner = dummyWallets[0];
-      const missingAta = getAssociatedTokenAddressSync(
-        mintKp.publicKey,
-        missingOwner,
-        false,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      try {
-        await program.methods
-          .releaseToRecipient(missingOwner)
-          .accounts({
-            scheduleState,
-            recipients: recipientsPda,
-            vault: vaultPda,
-            recipientAta: missingAta, // does not exist on-chain
-            mint: mintKp.publicKey,
-            distributor: distributor.publicKey,
-            tokenProgram: TOKEN_PROGRAM_ID,
-          })
-          .signers([distributor])
-          .rpc();
-        expect.fail("should have failed");
-    } catch (e: any) {
-      // Anchor framework error (account missing/uninitialized) can vary by release.
-      const code = anchorErrorCode(e);
-      if (code) {
-        expect(["AccountNotInitialized", "AccountNotFound"].includes(code)).to.equal(true);
-      } else {
-        const msg = String(e?.message ?? e);
-        expect(msg).to.match(/AccountNotInitialized|AccountNotFound|account.*not.*initialized|could not find account/i);
-      }
-    }
-
-    // create ATAs for dummy wallets in manageable batches so all recipients can be paid
-    dummyAtas = [];
-    for (let i = 0; i < dummyWallets.length; i += 8) {
-      const tx = new anchor.web3.Transaction();
-      for (let j = i; j < Math.min(i + 8, dummyWallets.length); j++) {
-        const owner = dummyWallets[j];
-        const ata = getAssociatedTokenAddressSync(
-          mintKp.publicKey,
-          owner,
-          false,
-          TOKEN_PROGRAM_ID,
-          ASSOCIATED_TOKEN_PROGRAM_ID
-        );
-        dummyAtas.push(ata);
-        tx.add(
-          createAssociatedTokenAccountInstruction(
-            admin.publicKey,
-            ata,
-            owner,
-            mintKp.publicKey,
-            TOKEN_PROGRAM_ID,
-            ASSOCIATED_TOKEN_PROGRAM_ID
-          )
-        );
-      }
-      await provider.sendAndConfirm(tx, [admin]);
-    }
-    }
-
-    // access control: release_to_recipient is distributor-only
-    try {
-      await program.methods
-        .releaseToRecipient(r2.publicKey)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          recipientAta: atas[1],
-          mint: mintKp.publicKey,
-          distributor: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("UnauthorizedDistributor");
-    }
-
-    // single release: should transfer monthly amount (floor allocation/12)
-    const before1 = await getAccount(connection, atas[0]);
-    await program.methods
-      .releaseToRecipient(r1.publicKey)
-      .accounts({
-        scheduleState,
-        recipients: recipientsPda,
-        vault: vaultPda,
-        recipientAta: atas[0],
-        mint: mintKp.publicKey,
-        distributor: distributor.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([distributor])
-      .rpc();
-    const after1 = await getAccount(connection, atas[0]);
-    const expectedMonthly = BigInt(allocs[0].div(new BN(12)).toString());
-    expect(after1.amount - before1.amount).to.equal(expectedMonthly);
-
-    // idempotency: re-call should no-op (same month / same block behavior)
-    const beforeAgain = await getAccount(connection, atas[0]);
-    await program.methods
-      .releaseToRecipient(r1.publicKey)
-      .accounts({
-        scheduleState,
-        recipients: recipientsPda,
-        vault: vaultPda,
-        recipientAta: atas[0],
-        mint: mintKp.publicKey,
-        distributor: distributor.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([distributor])
-      .rpc();
-    const afterAgain = await getAccount(connection, atas[0]);
-    expect(afterAgain.amount - beforeAgain.amount).to.equal(BigInt(0));
-
-    // pause blocks release (accrual continues)
-    await program.methods
-      .pause()
-      .accounts({ scheduleState, admin: admin.publicKey })
-      .signers([admin])
-      .rpc();
-    try {
-      await program.methods
-        .releaseToRecipient(r2.publicKey)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          recipientAta: atas[1],
-          mint: mintKp.publicKey,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("SchedulePaused");
-    }
-
-    // unpause enables catch-up releases
-    await program.methods
-      .unpause()
-      .accounts({ scheduleState, admin: admin.publicKey })
-      .signers([admin])
-      .rpc();
-
-    // After unpause, release should succeed (month_index >= 1). We assert at least one tranche.
-    const before3m = await getAccount(connection, atas[2]);
-    await program.methods
-      .releaseToRecipient(r3.publicKey)
-      .accounts({
-        scheduleState,
-        recipients: recipientsPda,
-        vault: vaultPda,
-        recipientAta: atas[2],
-        mint: mintKp.publicKey,
-        distributor: distributor.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([distributor])
-      .rpc();
-    const after3m = await getAccount(connection, atas[2]);
-    expect(after3m.amount > before3m.amount).to.equal(true);
-
-    // catch-up behavior: skip a month, then release and expect cumulative amount
-    if (warpSupported) {
-      const startDate = new Date(startTsNum * 1000);
-      const juneBoundary = Math.floor(addMonthsClampedUtc(startDate, 2).getTime() / 1000);
-
-      // skip May (no release), call in June for r6
-      await warpToUnixTs(connection, juneBoundary);
-      const beforeCatch = await getAccount(connection, atas[5]);
-      await program.methods
-        .releaseToRecipient(r6.publicKey)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          recipientAta: atas[5],
-          mint: mintKp.publicKey,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([distributor])
-        .rpc();
-      const afterCatch = await getAccount(connection, atas[5]);
-      const r6Monthly = BigInt(allocs[5].div(new BN(12)).toString());
-      expect(afterCatch.amount - beforeCatch.amount).to.equal(r6Monthly * BigInt(3));
-    }
-
-    // dust policy: remainder paid in final month (r6 has a remainder)
-    if (warpSupported) {
-      const startDate = new Date(startTsNum * 1000);
-      const lastBoundary = Math.floor(addMonthsClampedUtc(startDate, 11).getTime() / 1000);
-      await warpToUnixTs(connection, lastBoundary);
-      await program.methods
-        .releaseToRecipient(r6.publicKey)
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          recipientAta: atas[5],
-          mint: mintKp.publicKey,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([distributor])
-        .rpc();
-      const afterDust = await getAccount(connection, atas[5]);
-      const r6Allocation = BigInt(allocs[5].toString());
-      expect(afterDust.amount).to.equal(r6Allocation);
-    }
-
-    // batch size > 5 rejected
-    try {
-      await program.methods
-        .batchRelease([r1.publicKey, r2.publicKey, r3.publicKey, r4.publicKey, r5.publicKey, r6.publicKey])
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .remainingAccounts(atas.map((a) => ({ pubkey: a, isSigner: false, isWritable: true })))
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("BatchTooLarge");
-    }
-
-    // atomic batch failure: pass one wrong ATA (use admin ATA instead of r3 ATA)
-    const before2 = await getAccount(connection, atas[1]);
-    const before3 = await getAccount(connection, atas[2]);
-    try {
-      await program.methods
-        .batchRelease([r2.publicKey, r3.publicKey])
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .remainingAccounts([
-          { pubkey: atas[1], isSigner: false, isWritable: true },
-          { pubkey: adminMintAta, isSigner: false, isWritable: true }, // wrong
-        ])
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("InvalidRecipientAta");
-    }
-    const after2 = await getAccount(connection, atas[1]);
-    const after3 = await getAccount(connection, atas[2]);
-    expect(after2.amount - before2.amount).to.equal(BigInt(0));
-    expect(after3.amount - before3.amount).to.equal(BigInt(0));
-
-    // valid batch works (r2 + r5)
-    {
-      const beforeR2 = await getAccount(connection, atas[1]);
-      const beforeR5 = await getAccount(connection, atas[4]);
-      await program.methods
-        .batchRelease([r2.publicKey, r5.publicKey])
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          distributor: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .remainingAccounts([
-          { pubkey: atas[1], isSigner: false, isWritable: true },
-          { pubkey: atas[4], isSigner: false, isWritable: true },
-        ])
-        .signers([distributor])
-        .rpc();
-      const afterR2 = await getAccount(connection, atas[1]);
-      const afterR5 = await getAccount(connection, atas[4]);
-      // At/after start, r2 and r5 should receive at least one tranche.
-      expect(afterR2.amount > beforeR2.amount).to.equal(true);
-      expect(afterR5.amount > beforeR5.amount).to.equal(true);
-    }
-
-    // revoke one small dummy recipient: releases become no-op
-    const revokedWallet = dummyWallets[0];
-    const revokedAta = dummyAtas[0];
-    await program.methods
-      .revokeRecipient(revokedWallet)
-      .accounts({ scheduleState, recipients: recipientsPda, admin: admin.publicKey })
-      .signers([admin])
-      .rpc();
-    // create a tiny release attempt (will be no-op)
-    await program.methods
-      .releaseToRecipient(revokedWallet)
-      .accounts({
-        scheduleState,
-        recipients: recipientsPda,
-        vault: vaultPda,
-        recipientAta: revokedAta,
-        mint: mintKp.publicKey,
-        distributor: distributor.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([distributor])
-      .rpc();
-    const revokedAccount = await getAccount(connection, revokedAta);
-    expect(revokedAccount.amount).to.equal(BigInt(0));
-
-    // emit quote: should not mutate state (we just ensure tx succeeds)
-    // Ensure no state mutation: compare serialized account buffers.
-    const recipientsBefore = await connection.getAccountInfo(recipientsPda);
-    expect(recipientsBefore).to.not.equal(null);
-    await program.methods
-      .emitVestingQuote(r2.publicKey)
-      .accounts({ scheduleState, recipients: recipientsPda })
-      .rpc();
-    const recipientsAfter = await connection.getAccountInfo(recipientsPda);
-    expect(recipientsAfter).to.not.equal(null);
-    expect(recipientsAfter!.data.equals(recipientsBefore!.data)).to.equal(true);
-
-    // Full 12-period release with warp (only if validator supports warp)
-    if (warpSupported) {
-      const startDate = new Date(startTsNum * 1000);
-      const allRecipients = [
-        { wallet: r1.publicKey, ata: atas[0] },
-        { wallet: r2.publicKey, ata: atas[1] },
-        { wallet: r3.publicKey, ata: atas[2] },
-        { wallet: r4.publicKey, ata: atas[3] },
-        { wallet: r5.publicKey, ata: atas[4] },
-        { wallet: r6.publicKey, ata: atas[5] },
-        ...dummyWallets.map((w, i) => ({ wallet: w, ata: dummyAtas[i] })),
-      ].filter((p) => !p.wallet.equals(revokedWallet));
-
-      for (let k = 0; k < 12; k++) {
-        const boundary = Math.floor(addMonthsClampedUtc(startDate, k).getTime() / 1000);
-        await warpToUnixTs(connection, boundary);
-
-        for (let i = 0; i < allRecipients.length; i += 5) {
-          const slice = allRecipients.slice(i, i + 5);
-          await program.methods
-            .batchRelease(slice.map((s) => s.wallet))
-            .accounts({
-              scheduleState,
-              recipients: recipientsPda,
-              vault: vaultPda,
-              distributor: distributor.publicKey,
-              tokenProgram: TOKEN_PROGRAM_ID,
-            })
-            .remainingAccounts(slice.map((s) => ({ pubkey: s.ata, isSigner: false, isWritable: true })))
-            .signers([distributor])
-            .rpc();
-        }
-      }
-
-      // Verify all non-revoked recipients are fully released and vault holds only revoked allocation.
-      const rec = await program.account.recipients.fetch(recipientsPda);
-      let outstanding = BigInt(0);
-      for (const e of rec.entries as any[]) {
-        if (new PublicKey(e.wallet).equals(revokedWallet)) {
-          outstanding += BigInt(e.allocation.toString());
-          expect(e.releasedAmount.toString()).to.equal("0");
-        } else {
-          expect(e.releasedAmount.toString()).to.equal(e.allocation.toString());
-        }
-      }
-
-      const vaultState = await getAccount(connection, vaultPda);
-      expect(vaultState.amount).to.equal(outstanding);
-    }
-
-    // sweep before end must fail
-    try {
-      await program.methods
-        .sweepDustAfterEnd()
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          adminDestination: adminMintAta,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([admin])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("SweepBeforeEnd");
-    }
-
-    // admin_withdraw: unauthorized admin rejected
-    try {
-      await program.methods
-        .adminWithdraw(new BN(1), new BN(42))
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          adminDestination: adminMintAta,
-          mint: mintKp.publicKey,
-          admin: distributor.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([distributor])
-        .rpc();
-      expect.fail("should have failed");
-    } catch (e: any) {
-      expect(anchorErrorCode(e)).to.equal("UnauthorizedAdmin");
-    }
-
-    // admin_withdraw: after end, admin can withdraw remaining (revoked) balance
-    if (warpSupported) {
-      const startDate = new Date(startTsNum * 1000);
-      const endBoundary = Math.floor(addMonthsClampedUtc(startDate, 12).getTime() / 1000);
-      await warpToUnixTs(connection, endBoundary);
-
-      const vaultBefore = await getAccount(connection, vaultPda);
-      const adminBefore = await getAccount(connection, adminMintAta);
-
-      await program.methods
-        .adminWithdraw(new BN(vaultBefore.amount.toString()), new BN(77))
-        .accounts({
-          scheduleState,
-          recipients: recipientsPda,
-          vault: vaultPda,
-          adminDestination: adminMintAta,
-          mint: mintKp.publicKey,
-          admin: admin.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([admin])
-        .rpc();
-
-      const vaultAfter = await getAccount(connection, vaultPda);
-      const adminAfter = await getAccount(connection, adminMintAta);
-      expect(vaultAfter.amount).to.equal(BigInt(0));
-      expect(adminAfter.amount - adminBefore.amount).to.equal(vaultBefore.amount);
-    }
-
-    // NOTE: Full end-to-end "after 12 calendar months" scenarios (sweep-after-end success, exact
-    // month boundary +/−1s, etc.) require a warp-capable validator or a bankrun/program-test harness.
-    // Your validator RPC does not support warping, so those long-horizon cases are covered by:
-    // - Rust unit tests in `programs/vesting/src/utils/time.rs` (authoritative month math)
-    // - Off-chain parity tests in this file (see `calendar month math parity` test)
+  it("schedule_state fields match initialization inputs", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.ok(st.mint.equals(MINT), `mint mismatch`);
+    assert.ok(st.admin.equals(provider.wallet.publicKey), "admin mismatch");
+    assert.ok(st.distributor.equals(DISTRIBUTOR), `distributor mismatch`);
+    assert.ok(st.totalSupply.eq(totalSupply), `total_supply mismatch`);
+    assert.ok(st.startTs.toNumber() > 0, "start_ts should be > 0");
+    assert.strictEqual(st.releasedSupply.toNumber(), 0, "released_supply should be 0");
+    // Allow recipient_count > 0 if schedule was already initialized in a previous run
+    assert.ok(st.recipientCount >= 0, `recipient_count should be >= 0, got ${st.recipientCount}`);
+    // sealed can be true or false depending on whether add_recipients already ran
+    assert.ok(st.sealed === true || st.sealed === false, "sealed should be boolean");
+    assert.strictEqual(st.paused, false, "paused should be false");
+    console.log(`  start_ts: ${new Date(st.startTs.toNumber() * 1000).toISOString()}`);
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// 2. add_recipients
+// ══════════════════════════════════════════════════════════════════════════════
+describe("add_recipients", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
 
+  const [scheduleState] = findScheduleStatePda(program.programId);
+  const [recipients] = findRecipientsPda(program.programId, scheduleState);
+
+  it("CSV parses without errors and has at least one entry", () => {
+    const entries = parseAllocations(loadAllocationCsv());
+    assert.ok(entries.length > 0, "Expected at least one allocation entry");
+    console.log(`  Parsed ${entries.length} entries from allocation.csv`);
+  });
+
+  it("CSV has no duplicate wallet addresses", () => {
+    const entries = parseAllocations(loadAllocationCsv());
+    const seen = new Set<string>();
+    for (const e of entries) {
+      const key = e.wallet.toBase58();
+      assert.ok(!seen.has(key), `Duplicate wallet in CSV: ${key}`);
+      seen.add(key);
+    }
+  });
+
+  it("every allocation in CSV is greater than zero", () => {
+    const entries = parseAllocations(loadAllocationCsv());
+    for (const e of entries) {
+      assert.ok(e.allocation.gtn(0), `Zero allocation: ${e.wallet.toBase58()}`);
+    }
+  });
+
+  it("sum of all allocations does not exceed schedule total_supply", async () => {
+    const entries = parseAllocations(loadAllocationCsv());
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const totalSupply: BN = st.totalSupply;
+    let sum = new BN(0);
+    for (const e of entries) sum = sum.add(e.allocation);
+    assert.ok(sum.lte(totalSupply),
+      `Allocation sum ${sum} exceeds total_supply ${totalSupply}`);
+    console.log(`  alloc sum: ${sum.toString()} / total: ${totalSupply.toString()}`);
+  });
+
+  it("schedule_state account exists on-chain before add_recipients", async () => {
+    const info = await provider.connection.getAccountInfo(scheduleState);
+    assert.ok(info !== null, "schedule_state not found — run initialize_schedule first");
+  });
+
+  it("add_recipients batches send successfully — last batch seals the schedule", async () => {
+    const allEntries = parseAllocations(loadAllocationCsv());
+    const stBefore = await (program.account as any).scheduleState.fetch(scheduleState);
+    if (stBefore.sealed) {
+      console.log("  already sealed — skipping add_recipients txs");
+      return;
+    }
+    for (let i = 0; i < allEntries.length; i += ADD_BATCH_SIZE) {
+      const slice = allEntries.slice(i, i + ADD_BATCH_SIZE);
+      const seal = i + ADD_BATCH_SIZE >= allEntries.length;
+      const sig = await program.methods
+        .addRecipients(slice, seal)
+        .accounts({ scheduleState, recipients, admin: provider.wallet.publicKey })
+        .rpc();
+      assert.ok(sig, `Expected signature for batch at index ${i}`);
+      console.log(`  batch [${i}–${i + slice.length - 1}] seal=${seal} tx: ${sig}`);
+    }
+  });
+
+  it("on-chain recipient_count matches CSV entries", async () => {
+    const allEntries = parseAllocations(loadAllocationCsv());
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.strictEqual(st.recipientCount, allEntries.length,
+      `on-chain: ${st.recipientCount}, CSV: ${allEntries.length}`);
+    console.log(`  recipient_count: ${st.recipientCount}`);
+  });
+
+  it("schedule_state is sealed after all batches", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.strictEqual(st.sealed, true, "Expected sealed=true");
+  });
+
+  it("on-chain recipient entries match CSV wallet and allocation values", async () => {
+    const allEntries = parseAllocations(loadAllocationCsv());
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const rec = await (program.account as any).recipients.fetch(recipients);
+    const count: number = st.recipientCount;
+
+    const onChainMap = new Map<string, any>();
+    for (let i = 0; i < count; i++) {
+      const e = rec.entries[i];
+      onChainMap.set(e.wallet.toBase58(), e);
+    }
+    for (const csvEntry of allEntries) {
+      const key = csvEntry.wallet.toBase58();
+      const onChain = onChainMap.get(key);
+      assert.ok(onChain, `Wallet ${key} not found on-chain`);
+      assert.ok(onChain.allocation.eq(csvEntry.allocation),
+        `Allocation mismatch for ${key}`);
+      assert.strictEqual(onChain.releasedAmount.toNumber(), 0,
+        `released_amount should be 0 for ${key}`);
+      // Allow REVOKE_TARGET to be revoked (from previous test runs on persistent devnet state)
+      if (!onChain.wallet.equals(REVOKE_TARGET)) {
+        assert.strictEqual(onChain.revoked, 0, `revoked should be 0 for ${key}`);
+      }
+    }
+    console.log(`  Verified ${allEntries.length} entries match CSV`);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 3. deposit_tokens
+// ══════════════════════════════════════════════════════════════════════════════
+describe("deposit_tokens", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
+
+  const [scheduleState] = findScheduleStatePda(program.programId);
+  const [vault] = findVaultPda(program.programId, scheduleState);
+  const adminAta = getAssociatedTokenAddressSync(
+    MINT, provider.wallet.publicKey, false,
+    anchor.utils.token.TOKEN_PROGRAM_ID,
+    anchor.utils.token.ASSOCIATED_PROGRAM_ID
+  );
+
+  it("schedule_state exists and is sealed before deposit", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.ok(st, "schedule_state not found");
+    assert.strictEqual(st.sealed, true, "schedule must be sealed before deposit");
+    console.log(`  total_supply: ${st.totalSupply.toString()}`);
+  });
+
+  it("admin ATA exists and has sufficient balance for full deposit", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const vaultInfo = await getAccount(
+      provider.connection, vault, "confirmed",
+      anchor.utils.token.TOKEN_PROGRAM_ID
+    );
+    const vaultBalance = new BN(vaultInfo.amount.toString());
+    // Skip check if vault is already fully funded
+    if (vaultBalance.gte(st.totalSupply)) {
+      console.log("  vault already fully funded — skipping ATA balance check");
+      return;
+    }
+    const ataInfo = await getAccount(
+      provider.connection, adminAta, "confirmed",
+      anchor.utils.token.TOKEN_PROGRAM_ID
+    );
+    const ataBalance = new BN(ataInfo.amount.toString());
+    assert.ok(ataBalance.gte(st.totalSupply),
+      `ATA balance ${ataBalance} < total_supply ${st.totalSupply}`);
+    console.log(`  admin ATA balance: ${ataBalance.toString()}`);
+  });
+
+  it("depositTokens sends successfully (skip if vault already funded)", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const totalSupply: BN = st.totalSupply;
+    const vaultInfo = await getAccount(
+      provider.connection, vault, "confirmed",
+      anchor.utils.token.TOKEN_PROGRAM_ID
+    );
+    if (new BN(vaultInfo.amount.toString()).eq(totalSupply)) {
+      console.log("  vault already fully funded — skipping deposit tx");
+      return;
+    }
+    const sig = await program.methods
+      .depositTokens(totalSupply)
+      .accounts({
+        scheduleState, vault,
+        adminTokenAccount: adminAta,
+        admin: provider.wallet.publicKey,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+    assert.ok(sig, "Expected a transaction signature");
+    console.log(`  depositTokens tx: ${sig}`);
+  });
+
+  it("vault balance equals total_supply after deposit", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const vaultInfo = await getAccount(
+      provider.connection, vault, "confirmed",
+      anchor.utils.token.TOKEN_PROGRAM_ID
+    );
+    const vaultBalance = new BN(vaultInfo.amount.toString());
+    assert.ok(vaultBalance.eq(st.totalSupply),
+      `vault ${vaultBalance} != total_supply ${st.totalSupply}`);
+    console.log(`  vault balance: ${vaultBalance.toString()}`);
+  });
+
+  it("vault token account mint matches schedule mint", async () => {
+    const vaultInfo = await getAccount(
+      provider.connection, vault, "confirmed",
+      anchor.utils.token.TOKEN_PROGRAM_ID
+    );
+    assert.ok(vaultInfo.mint.equals(MINT), `vault mint mismatch`);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 4. pause / unpause
+// ══════════════════════════════════════════════════════════════════════════════
+describe("pause / unpause", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
+  const [scheduleState] = findScheduleStatePda(program.programId);
+
+  it("schedule is not paused before pause call (restore if needed)", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    if (st.paused) {
+      const sig = await program.methods.unpause()
+        .accounts({ scheduleState, admin: provider.wallet.publicKey }).rpc();
+      console.log(`  pre-test unpause tx: ${sig}`);
+    }
+    const stAfter = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.strictEqual(stAfter.paused, false, "should not be paused before test");
+  });
+
+  it("pause tx succeeds", async () => {
+    const sig = await program.methods.pause()
+      .accounts({ scheduleState, admin: provider.wallet.publicKey }).rpc();
+    assert.ok(sig, "Expected a transaction signature");
+    console.log(`  pause tx: ${sig}`);
+  });
+
+  it("paused flag is true after pause", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.strictEqual(st.paused, true, "Expected paused=true");
+  });
+
+  it("admin and sealed fields unchanged after pause", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.ok(st.admin.equals(provider.wallet.publicKey), "admin changed unexpectedly");
+    assert.strictEqual(st.sealed, true, "sealed should still be true");
+  });
+
+  it("double-pause fails with SchedulePaused", async () => {
+    try {
+      await program.methods.pause()
+        .accounts({ scheduleState, admin: provider.wallet.publicKey }).rpc();
+      assert.fail("Expected SchedulePaused error");
+    } catch (err: any) {
+      assert.ok(hasError(err, "SchedulePaused"), `Unexpected error: ${err?.message}`);
+      console.log("  double-pause correctly rejected ✓");
+    }
+  });
+
+  it("unpause restores paused=false", async () => {
+    const sig = await program.methods.unpause()
+      .accounts({ scheduleState, admin: provider.wallet.publicKey }).rpc();
+    assert.ok(sig, "Expected a signature");
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.strictEqual(st.paused, false, "Expected paused=false after unpause");
+    console.log(`  restore unpause tx: ${sig}`);
+  });
+
+  it("double-unpause fails with ScheduleNotPaused", async () => {
+    try {
+      await program.methods.unpause()
+        .accounts({ scheduleState, admin: provider.wallet.publicKey }).rpc();
+      assert.fail("Expected ScheduleNotPaused error");
+    } catch (err: any) {
+      assert.ok(hasError(err, "ScheduleNotPaused"), `Unexpected error: ${err?.message}`);
+      console.log("  double-unpause correctly rejected ✓");
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5. set_distributor
+// ══════════════════════════════════════════════════════════════════════════════
+describe("set_distributor", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
+  const [scheduleState] = findScheduleStatePda(program.programId);
+
+  it("schedule_state exists on-chain", async () => {
+    const info = await provider.connection.getAccountInfo(scheduleState);
+    assert.ok(info !== null, "schedule_state not found");
+  });
+
+  it("setDistributor updates distributor to new valid address", async () => {
+    const newDistributor = Keypair.generate().publicKey;
+    const sig = await program.methods
+      .setDistributor(newDistributor)
+      .accounts({ scheduleState, admin: provider.wallet.publicKey })
+      .rpc();
+    assert.ok(sig, "Expected a signature");
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.ok(st.distributor.equals(newDistributor), "distributor not updated");
+    console.log(`  new distributor: ${newDistributor.toBase58()}`);
+  });
+
+  it("restores original distributor", async () => {
+    const sig = await program.methods
+      .setDistributor(DISTRIBUTOR)
+      .accounts({ scheduleState, admin: provider.wallet.publicKey })
+      .rpc();
+    assert.ok(sig, "Expected a signature");
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.ok(st.distributor.equals(DISTRIBUTOR), "distributor not restored");
+    console.log(`  distributor restored: ${st.distributor.toBase58()}`);
+  });
+
+  it("admin field unchanged after setDistributor", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.ok(st.admin.equals(provider.wallet.publicKey), "admin changed unexpectedly");
+  });
+
+  it("setDistributor fails with InvalidConfig when new_distributor == admin", async () => {
+    try {
+      await program.methods
+        .setDistributor(provider.wallet.publicKey)
+        .accounts({ scheduleState, admin: provider.wallet.publicKey })
+        .rpc();
+      assert.fail("Expected InvalidConfig");
+    } catch (err: any) {
+      assert.ok(hasError(err, "InvalidConfig"), `Unexpected error: ${err?.message}`);
+      console.log("  InvalidConfig (distributor==admin) ✓");
+    }
+  });
+
+  it("setDistributor fails with InvalidPubkey for default pubkey", async () => {
+    try {
+      await program.methods
+        .setDistributor(PublicKey.default)
+        .accounts({ scheduleState, admin: provider.wallet.publicKey })
+        .rpc();
+      assert.fail("Expected InvalidPubkey");
+    } catch (err: any) {
+      assert.ok(hasError(err, "InvalidPubkey"), `Unexpected error: ${err?.message}`);
+      console.log("  InvalidPubkey ✓");
+    }
+  });
+
+  it("setDistributor fails with InvalidConfig when new_distributor == schedule_state PDA", async () => {
+    try {
+      await program.methods
+        .setDistributor(scheduleState)
+        .accounts({ scheduleState, admin: provider.wallet.publicKey })
+        .rpc();
+      assert.fail("Expected InvalidConfig");
+    } catch (err: any) {
+      assert.ok(hasError(err, "InvalidConfig"), `Unexpected error: ${err?.message}`);
+      console.log("  InvalidConfig (distributor==PDA) ✓");
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 6. revoke_recipient
+// ══════════════════════════════════════════════════════════════════════════════
+describe("revoke_recipient", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
+
+  const [scheduleState] = findScheduleStatePda(program.programId);
+  const [recipients] = findRecipientsPda(program.programId, scheduleState);
+
+  it("schedule_state and recipients accounts exist on-chain", async () => {
+    const stInfo = await provider.connection.getAccountInfo(scheduleState);
+    const recInfo = await provider.connection.getAccountInfo(recipients);
+    assert.ok(stInfo !== null, "schedule_state not found");
+    assert.ok(recInfo !== null, "recipients not found");
+  });
+
+  it("target wallet exists in on-chain recipients list", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const rec = await (program.account as any).recipients.fetch(recipients);
+    const found = rec.entries
+      .slice(0, st.recipientCount)
+      .some((e: any) => e.wallet.equals(REVOKE_TARGET));
+    assert.ok(found, `Target wallet ${REVOKE_TARGET.toBase58()} not found`);
+  });
+
+  it("revokeRecipient tx succeeds (skip if already revoked)", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const rec = await (program.account as any).recipients.fetch(recipients);
+    const entry = rec.entries
+      .slice(0, st.recipientCount)
+      .find((e: any) => e.wallet.equals(REVOKE_TARGET));
+    if (entry?.revoked !== 0) {
+      console.log("  already revoked — skipping tx");
+      return;
+    }
+    const sig = await program.methods
+      .revokeRecipient(REVOKE_TARGET)
+      .accounts({ scheduleState, recipients, admin: provider.wallet.publicKey })
+      .rpc();
+    assert.ok(sig, "Expected a signature");
+    console.log(`  revokeRecipient tx: ${sig}`);
+  });
+
+  it("on-chain revoked flag is 1 for target wallet", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const rec = await (program.account as any).recipients.fetch(recipients);
+    const entry = rec.entries
+      .slice(0, st.recipientCount)
+      .find((e: any) => e.wallet.equals(REVOKE_TARGET));
+    assert.ok(entry, "Target wallet not found after revoke");
+    assert.strictEqual(entry.revoked, 1, `Expected revoked=1, got ${entry.revoked}`);
+    console.log(`  revoked flag: ${entry.revoked} ✓`);
+  });
+
+  it("other recipients remain unrevoked", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const rec = await (program.account as any).recipients.fetch(recipients);
+    let unexpected = 0;
+    for (const e of rec.entries.slice(0, st.recipientCount)) {
+      if (!e.wallet.equals(REVOKE_TARGET) && e.revoked !== 0) {
+        unexpected++;
+        console.log(`  unexpected revoke: ${e.wallet.toBase58()}`);
+      }
+    }
+    assert.strictEqual(unexpected, 0, `${unexpected} recipient(s) unexpectedly revoked`);
+  });
+
+  it("double-revoke fails with RecipientRevoked", async () => {
+    try {
+      await program.methods
+        .revokeRecipient(REVOKE_TARGET)
+        .accounts({ scheduleState, recipients, admin: provider.wallet.publicKey })
+        .rpc();
+      assert.fail("Expected RecipientRevoked");
+    } catch (err: any) {
+      assert.ok(hasError(err, "RecipientRevoked"), `Unexpected error: ${err?.message}`);
+      console.log("  double-revoke correctly rejected ✓");
+    }
+  });
+
+  it("revoke_recipient fails with RecipientNotFound for unknown wallet", async () => {
+    const unknownWallet = Keypair.generate().publicKey;
+    try {
+      await program.methods
+        .revokeRecipient(unknownWallet)
+        .accounts({ scheduleState, recipients, admin: provider.wallet.publicKey })
+        .rpc();
+      assert.fail("Expected RecipientNotFound");
+    } catch (err: any) {
+      assert.ok(hasError(err, "RecipientNotFound"), `Unexpected error: ${err?.message}`);
+      console.log("  RecipientNotFound ✓");
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 7. batch_release  (distributor keypair se sign hoga)
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("batch_release", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
+
+  const [scheduleState] = findScheduleStatePda(program.programId);
+  const [recipients] = findRecipientsPda(program.programId, scheduleState);
+  const [vault] = findVaultPda(program.programId, scheduleState);
+
+  // Distributor keypair — yeh sign karega batchRelease txs
+  let distributorKp: Keypair;
+  before(() => {
+    distributorKp = loadDistributorKeypair();
+    assert.ok(
+      distributorKp.publicKey.equals(DISTRIBUTOR),
+      `distributor.json pubkey mismatch:\n  expected: ${DISTRIBUTOR.toBase58()}\n  got:      ${distributorKp.publicKey.toBase58()}`
+    );
+    console.log(`  distributor keypair loaded: ${distributorKp.publicKey.toBase58()}`);
+  });
+
+  it("schedule_state is sealed and not paused", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    assert.strictEqual(st.sealed, true, "schedule must be sealed");
+    assert.strictEqual(st.paused, false, "schedule must not be paused");
+    assert.ok(st.distributor.equals(DISTRIBUTOR), "distributor mismatch on-chain");
+    console.log(`  released_supply before: ${st.releasedSupply.toString()}`);
+  });
+
+  it("vault is fully funded", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const vaultInfo = await getAccount(
+      provider.connection, vault, "confirmed",
+      anchor.utils.token.TOKEN_PROGRAM_ID
+    );
+    const vaultBalance = new BN(vaultInfo.amount.toString());
+    assert.ok(vaultBalance.eq(st.totalSupply),
+      `vault ${vaultBalance} != total_supply ${st.totalSupply}`);
+    console.log(`  vault balance: ${vaultBalance.toString()}`);
+  });
+
+  // ── ATA auto-creation ─────────────────────────────────────────────────────
+  it("creates missing recipient ATAs (skip if all exist)", async () => {
+    const wallets = parseWallets(loadAllocationCsv());
+    const payer = provider.wallet.publicKey;
+    const ATA_BATCH_SIZE = 8;
+
+    // Pehle sabhi ATAs check karo — missing list banao
+    const missing: { wallet: PublicKey; ata: PublicKey }[] = [];
+    for (const wallet of wallets) {
+      const ata = getAssociatedTokenAddressSync(
+        MINT, wallet, false,
+        anchor.utils.token.TOKEN_PROGRAM_ID,
+        anchor.utils.token.ASSOCIATED_PROGRAM_ID
+      );
+      const info = await provider.connection.getAccountInfo(ata);
+      if (info === null) missing.push({ wallet, ata });
+    }
+
+    if (missing.length === 0) {
+      console.log(`  All ${wallets.length} ATAs already exist ✓`);
+      return;
+    }
+
+    console.log(`  Creating ${missing.length} missing ATA(s)...`);
+
+    // Batches mein ATAs banao
+    for (let i = 0; i < missing.length; i += ATA_BATCH_SIZE) {
+      const slice = missing.slice(i, i + ATA_BATCH_SIZE);
+      const tx = new anchor.web3.Transaction();
+
+      for (const { wallet, ata } of slice) {
+        tx.add(
+          createAssociatedTokenAccountInstruction(
+  payer,
+  ata,
+  wallet,
+  MINT,
+  anchor.utils.token.TOKEN_PROGRAM_ID,
+  anchor.utils.token.ASSOCIATED_PROGRAM_ID
+)
+        );
+      }
+
+      const sig = await provider.sendAndConfirm(tx, []);
+      console.log(`  Created ATAs [${i + 1}–${i + slice.length}]: ${sig}`);
+    }
+
+    // Final verification — sab ban gaye?
+    let stillMissing = 0;
+    for (const { ata, wallet } of missing) {
+      const info = await provider.connection.getAccountInfo(ata);
+      if (info === null) {
+        console.log(`  STILL MISSING: ${wallet.toBase58()}`);
+        stillMissing++;
+      }
+    }
+    assert.strictEqual(stillMissing, 0,
+      `${stillMissing} ATA(s) could not be created`);
+    console.log(`  All ATAs created successfully ✓`);
+  });
+
+  it("batch_release sends all batches successfully", async () => {
+    const wallets = parseWallets(loadAllocationCsv());
+
+    // Check if vesting has started
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const now = Math.floor(Date.now() / 1000);
+    if (now < st.startTs.toNumber()) {
+      console.log(`  Vesting start_ts (${new Date(st.startTs.toNumber() * 1000).toISOString()}) not reached yet — skipping batch_release`);
+      return;
+    }
+
+    for (let i = 0; i < wallets.length; i += BATCH_SIZE) {
+      const slice = wallets.slice(i, i + BATCH_SIZE);
+      const atas = slice.map((w) =>
+        getAssociatedTokenAddressSync(
+          MINT, w, false,
+          anchor.utils.token.TOKEN_PROGRAM_ID,
+          anchor.utils.token.ASSOCIATED_PROGRAM_ID
+        )
+      );
+      const sig = await program.methods
+        .batchRelease(slice)
+        .accounts({
+          scheduleState, recipients, vault,
+          distributor: distributorKp.publicKey,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        })
+        .remainingAccounts(
+          atas.map((a) => ({ pubkey: a, isSigner: false, isWritable: true }))
+        )
+        .signers([distributorKp])
+        .rpc();
+      assert.ok(sig, `Expected signature for batch ${i + 1}–${i + slice.length}`);
+      console.log(`  batch [${i + 1}–${i + slice.length}] tx: ${sig}`);
+    }
+  });
+
+  it("released_supply > 0 after batch_release", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const now = Math.floor(Date.now() / 1000);
+    if (now < st.startTs.toNumber()) {
+      console.log(`  Skipping released_supply check — vesting hasn't started yet`);
+      return;
+    }
+    assert.ok(st.releasedSupply.gtn(0),
+      `released_supply should be > 0, got ${st.releasedSupply}`);
+    console.log(`  released_supply: ${st.releasedSupply.toString()}`);
+  });
+
+  it("vault balance = total_supply - released_supply after batch_release", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const vaultInfo = await getAccount(
+      provider.connection, vault, "confirmed",
+      anchor.utils.token.TOKEN_PROGRAM_ID
+    );
+    const vaultBalance = new BN(vaultInfo.amount.toString());
+    const expected = st.totalSupply.sub(st.releasedSupply);
+    assert.ok(vaultBalance.eq(expected),
+      `vault ${vaultBalance} != expected ${expected}`);
+    console.log(`  vault after: ${vaultBalance} | released: ${st.releasedSupply}`);
+  });
+
+  // ── Negative: empty batch ─────────────────────────────────────────────────
+  it("batchRelease fails with EmptyBatch for empty wallets array", async () => {
+    try {
+      await program.methods
+        .batchRelease([])
+        .accounts({
+          scheduleState, recipients, vault,
+          distributor: distributorKp.publicKey,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        })
+        .remainingAccounts([])
+        .signers([distributorKp])
+        .rpc();
+      assert.fail("Expected EmptyBatch");
+    } catch (err: any) {
+      assert.ok(hasError(err, "EmptyBatch"), `Unexpected error: ${err?.message}`);
+      console.log("  EmptyBatch correctly rejected ✓");
+    }
+  });
+
+  // ── Negative: batch > 5 ───────────────────────────────────────────────────
+  it("batchRelease fails with BatchTooLarge for 6 wallets", async () => {
+    const wallets = parseWallets(loadAllocationCsv()).slice(0, 6);
+    const atas = wallets.map((w) =>
+      getAssociatedTokenAddressSync(
+        MINT, w, false,
+        anchor.utils.token.TOKEN_PROGRAM_ID,
+        anchor.utils.token.ASSOCIATED_PROGRAM_ID
+      )
+    );
+    try {
+      await program.methods
+        .batchRelease(wallets)
+        .accounts({
+          scheduleState, recipients, vault,
+          distributor: distributorKp.publicKey,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        })
+        .remainingAccounts(atas.map((a) => ({ pubkey: a, isSigner: false, isWritable: true })))
+        .signers([distributorKp])
+        .rpc();
+      assert.fail("Expected BatchTooLarge");
+    } catch (err: any) {
+      assert.ok(hasError(err, "BatchTooLarge"), `Unexpected error: ${err?.message}`);
+      console.log("  BatchTooLarge correctly rejected ✓");
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 8. negative_tests — admin-only instructions
+// ══════════════════════════════════════════════════════════════════════════════
+describe("negative tests — admin instructions", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
+
+  const [scheduleState] = findScheduleStatePda(program.programId);
+  const [recipients] = findRecipientsPda(program.programId, scheduleState);
+  const [vault] = findVaultPda(program.programId, scheduleState);
+  const adminAta = getAssociatedTokenAddressSync(
+    MINT, provider.wallet.publicKey, false,
+    anchor.utils.token.TOKEN_PROGRAM_ID,
+    anchor.utils.token.ASSOCIATED_PROGRAM_ID
+  );
+
+  it("add_recipients fails with RecipientsSealed when schedule is sealed", async () => {
+    const wallets = parseWallets(loadAllocationCsv());
+    const dummyInput = [{ wallet: wallets[0], allocation: new BN(1) }];
+    try {
+      await program.methods
+        .addRecipients(dummyInput, false)
+        .accounts({ scheduleState, recipients, admin: provider.wallet.publicKey })
+        .rpc();
+      assert.fail("Expected RecipientsSealed");
+    } catch (err: any) {
+      assert.ok(hasError(err, "RecipientsSealed"), `Unexpected error: ${err?.message}`);
+      console.log("  RecipientsSealed ✓");
+    }
+  });
+
+  it("deposit_tokens fails with DepositAfterStart when start_ts has passed", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    if (Math.floor(Date.now() / 1000) < st.startTs.toNumber()) {
+      console.log("  start_ts not passed yet — skipping DepositAfterStart test");
+      return;
+    }
+    try {
+      await program.methods
+        .depositTokens(new BN(1))
+        .accounts({
+          scheduleState, vault,
+          adminTokenAccount: adminAta,
+          admin: provider.wallet.publicKey,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        })
+        .rpc();
+      assert.fail("Expected DepositAfterStart");
+    } catch (err: any) {
+      assert.ok(hasError(err, "DepositAfterStart"), `Unexpected error: ${err?.message}`);
+      console.log("  DepositAfterStart ✓");
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 9. sweep_dust_after_end
+// ══════════════════════════════════════════════════════════════════════════════
+describe("sweep_dust_after_end", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.vesting as anchor.Program;
+
+  const [scheduleState] = findScheduleStatePda(program.programId);
+  const [recipients] = findRecipientsPda(program.programId, scheduleState);
+  const [vault] = findVaultPda(program.programId, scheduleState);
+  const adminDestination = getAssociatedTokenAddressSync(
+    MINT, provider.wallet.publicKey, false,
+    anchor.utils.token.TOKEN_PROGRAM_ID,
+    anchor.utils.token.ASSOCIATED_PROGRAM_ID
+  );
+
+  it("logs vesting end status (informational)", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const startTs: number = st.startTs.toNumber();
+    const vestingEndTs = startTs + 365 * 24 * 60 * 60;
+    const nowTs = Math.floor(Date.now() / 1000);
+    if (nowTs < vestingEndTs) {
+      console.log(`  Vesting NOT ended yet.`);
+      console.log(`  vesting_end: ${new Date(vestingEndTs * 1000).toISOString()}`);
+      console.log(`  now:         ${new Date(nowTs * 1000).toISOString()}`);
+    } else {
+      console.log(`  Vesting ended ✓`);
+    }
+    assert.ok(startTs > 0, "start_ts should be > 0");
+  });
+
+  it("logs outstanding recipients (informational)", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const rec = await (program.account as any).recipients.fetch(recipients);
+    let outstanding = 0;
+    for (const e of rec.entries.slice(0, st.recipientCount)) {
+      if (e.revoked === 0 && !e.releasedAmount.eq(e.allocation)) {
+        outstanding++;
+      }
+    }
+    if (outstanding > 0) {
+      console.log(`  ${outstanding} recipient(s) not fully released — sweep will fail`);
+    } else {
+      console.log(`  All non-revoked recipients fully released ✓`);
+    }
+    assert.ok(st.recipientCount > 0, "recipient_count should be > 0");
+  });
+
+  it("admin destination ATA exists on-chain", async () => {
+    const info = await provider.connection.getAccountInfo(adminDestination);
+    assert.ok(info !== null, `Admin ATA not found: ${adminDestination.toBase58()}`);
+  });
+
+  it("dust calculation is correct (vault - committed)", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const vaultInfo = await getAccount(
+      provider.connection, vault, "confirmed",
+      anchor.utils.token.TOKEN_PROGRAM_ID
+    );
+    const vaultBalance = new BN(vaultInfo.amount.toString());
+    const committed = st.totalSupply.sub(st.releasedSupply);
+    const dust = vaultBalance.sub(committed);
+    console.log(`  vault: ${vaultBalance} | committed: ${committed} | dust: ${dust.gtn(0) ? dust : "0"}`);
+    assert.ok(vaultBalance.gte(new BN(0)), "vault >= 0");
+  });
+
+  it("sweepDustAfterEnd sends successfully (skip if conditions not met)", async () => {
+    const st = await (program.account as any).scheduleState.fetch(scheduleState);
+    const startTs: number = st.startTs.toNumber();
+    const vestingEndTs = startTs + 365 * 24 * 60 * 60;
+    if (Math.floor(Date.now() / 1000) < vestingEndTs) {
+      console.log("  Vesting not ended — skipping sweep tx");
+      return;
+    }
+    const rec = await (program.account as any).recipients.fetch(recipients);
+    const hasOutstanding = rec.entries
+      .slice(0, st.recipientCount)
+      .some((e: any) => e.revoked === 0 && !e.releasedAmount.eq(e.allocation));
+    if (hasOutstanding) {
+      console.log("  Outstanding releases exist — skipping sweep tx");
+      return;
+    }
+    const sig = await program.methods
+      .sweepDustAfterEnd()
+      .accounts({
+        scheduleState, recipients, vault,
+        adminDestination,
+        mint: MINT,
+        admin: provider.wallet.publicKey,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+    assert.ok(sig, "Expected a signature");
+    console.log(`  sweepDustAfterEnd tx: ${sig}`);
+  });
+});

@@ -12,8 +12,10 @@ pub fn add_recipients(
     let st = &mut ctx.accounts.schedule_state;
     require_keys_eq!(ctx.accounts.admin.key(), st.admin, VestingError::UnauthorizedAdmin);
     require!(!st.sealed, VestingError::RecipientsSealed);
-    let recipients = &mut ctx.accounts.recipients;
-    let mut added: u8 = 0;
+
+    let recipients = &mut ctx.accounts.recipients.load_mut()?;
+    // FIX #2: u16 to handle up to 65535, safe for any realistic MAX_RECIPIENTS
+    let mut added: u16 = 0;
 
     for (i, input) in inputs.iter().enumerate() {
         require!(input.wallet != Pubkey::default(), VestingError::InvalidPubkey);
@@ -44,6 +46,16 @@ pub fn add_recipients(
             .checked_add(remainder)
             .ok_or(VestingError::MathOverflow)?;
 
+        // FIX #1: Pre-validate allocation sum BEFORE writing entry to state.
+        // This avoids "write first, validate later" pattern.
+        let prospective_sum = allocations_sum_u128(&recipients.entries, st.recipient_count)?
+            .checked_add(input.allocation as u128)
+            .ok_or(VestingError::MathOverflow)?;
+        require!(
+            prospective_sum <= st.total_supply as u128,
+            VestingError::AllocationSumExceedsTotalSupply
+        );
+
         let idx = st.recipient_count as usize;
         recipients.entries[idx] = RecipientEntry {
             wallet: input.wallet,
@@ -61,18 +73,8 @@ pub fn add_recipients(
         added = added.checked_add(1).ok_or(VestingError::MathOverflow)?;
     }
 
-    // Enforce allocation sum does not exceed total supply at any point.
+    // Final sum for seal check (still needed for exact-match at seal).
     let sum = allocations_sum_u128(&recipients.entries, st.recipient_count)?;
-    require!(
-        sum <= st.total_supply as u128,
-        VestingError::AllocationSumExceedsTotalSupply
-    );
-
-    emit!(RecipientsAdded {
-        count_added: added,
-        new_total: st.recipient_count,
-        sealed: false,
-    });
 
     if seal {
         require!(
@@ -80,12 +82,15 @@ pub fn add_recipients(
             VestingError::AllocationSumMismatchAtSeal
         );
         st.sealed = true;
-        emit!(RecipientsAdded {
-            count_added: 0,
-            new_total: st.recipient_count,
-            sealed: true,
-        });
     }
+
+    // FIX #3: Single event emit — sealed field reflects actual final state.
+    // No more double-emit when seal=true.
+    emit!(RecipientsAdded {
+        count_added: added,
+        new_total: st.recipient_count,
+        sealed: st.sealed,
+    });
 
     Ok(())
 }
@@ -110,7 +115,7 @@ pub struct AddRecipients<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Box<Account<'info, Recipients>>,
+    pub recipients: AccountLoader<'info, Recipients>,
 
     #[account(mut)]
     pub admin: Signer<'info>,
@@ -118,9 +123,8 @@ pub struct AddRecipients<'info> {
 
 #[event]
 pub struct RecipientsAdded {
-    pub count_added: u8,
+    // FIX #2: u16 instead of u8
+    pub count_added: u16,
     pub new_total: u8,
     pub sealed: bool,
 }
-
-

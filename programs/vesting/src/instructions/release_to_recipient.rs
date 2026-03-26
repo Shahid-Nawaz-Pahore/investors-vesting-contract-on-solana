@@ -7,52 +7,57 @@ use crate::state::{Recipients, ScheduleState};
 use crate::utils::time;
 
 pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) -> Result<()> {
-    // Avoid borrow checker conflicts: capture AccountInfos/keys before taking mutable borrows.
     let schedule_state_ai = ctx.accounts.schedule_state.to_account_info();
     let schedule_state_bump = ctx.bumps.schedule_state;
 
-    let st = &mut ctx.accounts.schedule_state;
-    require!(st.sealed, VestingError::RecipientsNotSealed);
-    require!(!st.paused, VestingError::SchedulePaused);
+    // Copy needed fields from st before taking recipients borrow.
+    let sealed = ctx.accounts.schedule_state.sealed;
+    let paused = ctx.accounts.schedule_state.paused;
+    let distributor = ctx.accounts.schedule_state.distributor;
+    let released_supply = ctx.accounts.schedule_state.released_supply;
+    let total_supply = ctx.accounts.schedule_state.total_supply;
+    let recipient_count = ctx.accounts.schedule_state.recipient_count;
+    let mint = ctx.accounts.schedule_state.mint;
+    let start_ts = ctx.accounts.schedule_state.start_ts;
+
+    require!(sealed, VestingError::RecipientsNotSealed);
+    require!(!paused, VestingError::SchedulePaused);
     require_keys_eq!(
         ctx.accounts.distributor.key(),
-        st.distributor,
+        distributor,
         VestingError::UnauthorizedDistributor
     );
 
     let now = Clock::get()?.unix_timestamp;
-    let month_idx = time::month_index(now, st.start_ts)?;
+    let month_idx = time::month_index(now, start_ts)?;
 
-    // Enforce full funding before any release (released_supply == 0).
-    if st.released_supply == 0 {
+    if released_supply == 0 {
         require!(
-            ctx.accounts.vault.amount == st.total_supply,
+            ctx.accounts.vault.amount == total_supply,
             VestingError::VaultNotExactlyFunded
         );
     }
 
-    // Find recipient entry.
-    let recipients = &mut ctx.accounts.recipients;
+    // Load recipients via zero_copy.
+    let mut recipients = ctx.accounts.recipients.load_mut()?;
     let entry = recipients
         .entries
         .iter_mut()
-        .take(st.recipient_count as usize)
+        .take(recipient_count as usize)
         .find(|e| e.wallet == wallet)
         .ok_or(VestingError::RecipientNotFound)?;
 
-    // Require recipient ATA exists and is correct.
-    require_keys_eq!(ctx.accounts.mint.key(), st.mint, VestingError::InvalidTokenMint);
-    require_keys_eq!(ctx.accounts.vault.mint, st.mint, VestingError::InvalidTokenMint);
-    let expected_ata = expected_ata_address(&wallet, &st.mint)?;
+    require_keys_eq!(ctx.accounts.mint.key(), mint, VestingError::InvalidTokenMint);
+    require_keys_eq!(ctx.accounts.vault.mint, mint, VestingError::InvalidTokenMint);
+    let expected_ata = expected_ata_address(&wallet, &mint)?;
     require_keys_eq!(
         ctx.accounts.recipient_ata.key(),
         expected_ata,
         VestingError::InvalidRecipientAta
     );
-    // Strict ATA checks (pre-created ATA policy).
     require_keys_eq!(
         ctx.accounts.recipient_ata.mint,
-        st.mint,
+        mint,
         VestingError::InvalidTokenMint
     );
     require_keys_eq!(
@@ -61,9 +66,8 @@ pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) ->
         VestingError::InvalidTokenAccount
     );
 
-    // If revoked, no-op (stop future releases).
     if entry.revoked != 0 {
-    return Err(VestingError::RecipientRevoked.into());
+        return Err(VestingError::RecipientRevoked.into());
     }
 
     let vested = vested_amount(entry.monthly_amount, entry.final_amount, month_idx)?;
@@ -79,8 +83,18 @@ pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) ->
         VestingError::InsufficientVaultBalance
     );
 
-    // CPI transfer from vault to recipient ATA, signed by schedule_state PDA.
     let signer_seeds: &[&[&[u8]]] = &[&[b"schedule_state", &[schedule_state_bump]]];
+
+    // Drop recipients borrow before CPI.
+let (_monthly_amount, _final_amount, allocation) =
+        (entry.monthly_amount, entry.final_amount, entry.allocation);
+    let new_released = entry
+        .released_amount
+        .checked_add(releasable)
+        .ok_or(VestingError::MathOverflow)?;
+    entry.released_amount = new_released;
+    drop(recipients);
+
     token::transfer(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
@@ -94,12 +108,8 @@ pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) ->
         releasable,
     )?;
 
-    entry.released_amount = entry
-        .released_amount
-        .checked_add(releasable)
-        .ok_or(VestingError::MathOverflow)?;
-    st.released_supply = st
-        .released_supply
+    // Update schedule_state after CPI.
+    ctx.accounts.schedule_state.released_supply = released_supply
         .checked_add(releasable)
         .ok_or(VestingError::MathOverflow)?;
 
@@ -107,8 +117,8 @@ pub fn release_to_recipient(ctx: Context<ReleaseToRecipient>, wallet: Pubkey) ->
         wallet,
         month_index: month_idx,
         amount: releasable,
-        allocation: entry.allocation,
-        released_total: entry.released_amount,
+        allocation,
+        released_total: new_released,
     });
 
     Ok(())
@@ -132,7 +142,6 @@ fn vested_amount(monthly: u64, final_amount: u64, month_index: u8) -> Result<u64
 }
 
 fn expected_ata_address(owner: &Pubkey, mint: &Pubkey) -> Result<Pubkey> {
-    // ATA derivation: PDA(owner, token_program_id, mint) with associated token program id.
     let seeds: &[&[u8]] = &[
         owner.as_ref(),
         anchor_spl::token::ID.as_ref(),
@@ -152,7 +161,7 @@ pub struct ReleaseToRecipient<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Box<Account<'info, Recipients>>,
+    pub recipients: AccountLoader<'info, Recipients>,
 
     #[account(
         mut,
@@ -180,4 +189,3 @@ pub struct TokensReleased {
     pub allocation: u64,
     pub released_total: u64,
 }
-

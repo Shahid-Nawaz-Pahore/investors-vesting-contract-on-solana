@@ -52,7 +52,7 @@ pub mod __client_accounts_sweep_dust_after_end {
     pub use crate::instructions::__client_accounts_sweep_dust_after_end::*;
 }
 
-declare_id!("HM8jRjV7efYtRZ7JpgzqAprXN3mZkcnzT9oQoENkn221");
+declare_id!("6ZwThBj53u1bW3vEbbofj6GNmTo1qDwCCg8N5Aa4RDrV");
 
 #[program]
 pub mod vesting {
@@ -112,68 +112,71 @@ pub mod vesting {
 
     /// Batch release tokens to up to 5 recipients (distributor-only). Atomic.
     pub fn batch_release<'info>(
-        ctx: Context<'_, '_, '_, 'info, BatchRelease<'info>>,
-        wallets: Vec<Pubkey>,
-    ) -> Result<()> {
-        // NOTE: We implement the batch logic directly in the entrypoint to avoid
-        // `anchor_lang::Context` invariance lifetime coercion issues when delegating.
-        // This keeps everything in a single `'info` region.
+    ctx: Context<'_, '_, '_, 'info, BatchRelease<'info>>,
+    wallets: Vec<Pubkey>,
+) -> Result<()> {
+    let schedule_state_ai = ctx.accounts.schedule_state.to_account_info();
+    let token_program_key = ctx.accounts.token_program.key();
+    let token_program_ai = ctx.accounts.token_program.to_account_info();
+    let vault_ai = ctx.accounts.vault.to_account_info();
 
-        // Capture infos/keys before taking mutable borrows.
-        let schedule_state_ai = ctx.accounts.schedule_state.to_account_info();
-        let token_program_key = ctx.accounts.token_program.key();
-        let token_program_ai = ctx.accounts.token_program.to_account_info();
-        let vault_ai = ctx.accounts.vault.to_account_info();
+    // Copy st fields before any borrow.
+    let sealed = ctx.accounts.schedule_state.sealed;
+    let paused = ctx.accounts.schedule_state.paused;
+    let distributor = ctx.accounts.schedule_state.distributor;
+    let mint = ctx.accounts.schedule_state.mint;
+    let recipient_count = ctx.accounts.schedule_state.recipient_count;
+    let total_supply = ctx.accounts.schedule_state.total_supply;
+    let mut released_supply = ctx.accounts.schedule_state.released_supply;
 
-        let st = &mut ctx.accounts.schedule_state;
-        require!(st.sealed, VestingError::RecipientsNotSealed);
-        require!(!st.paused, VestingError::SchedulePaused);
-        require_keys_eq!(
-            ctx.accounts.distributor.key(),
-            st.distributor,
-            VestingError::UnauthorizedDistributor
-        );
+    require!(sealed, VestingError::RecipientsNotSealed);
+    require!(!paused, VestingError::SchedulePaused);
+    require_keys_eq!(
+        ctx.accounts.distributor.key(),
+        distributor,
+        VestingError::UnauthorizedDistributor
+    );
 
-        require!(!wallets.is_empty(), VestingError::EmptyBatch);
-        require!(
-            wallets.len() <= MAX_BATCH_RELEASE,
-            VestingError::BatchTooLarge
-        );
-        require!(
-            ctx.remaining_accounts.len() == wallets.len(),
-            VestingError::InvalidConfig
-        );
+    require!(!wallets.is_empty(), VestingError::EmptyBatch);
+    require!(wallets.len() <= MAX_BATCH_RELEASE, VestingError::BatchTooLarge);
+    require!(
+        ctx.remaining_accounts.len() == wallets.len(),
+        VestingError::InvalidConfig
+    );
 
-        let now = Clock::get()?.unix_timestamp;
-        let month_idx = crate::utils::time::month_index(now, st.start_ts)?;
+    let now = Clock::get()?.unix_timestamp;
+    let month_idx = crate::utils::time::month_index(now, ctx.accounts.schedule_state.start_ts)?;
 
-        // Validate vault SPL token account.
-        // IMPORTANT: do NOT hold any account data borrows across CPIs (will cause AccountBorrowFailed).
-        require_keys_eq!(*vault_ai.owner, token_program_key, VestingError::InvalidTokenProgram);
-        let mut vault_balance: u64 = {
-            let vault_data = vault_ai.try_borrow_data()?;
-            let vault_state = SplTokenAccount::unpack(&vault_data)
-                .map_err(|_| VestingError::InvalidTokenAccount)?;
-            require_keys_eq!(vault_state.mint, st.mint, VestingError::InvalidTokenMint);
-            vault_state.amount
-        };
+    require_keys_eq!(*vault_ai.owner, token_program_key, VestingError::InvalidTokenProgram);
+    let mut vault_balance: u64 = {
+        let vault_data = vault_ai.try_borrow_data()?;
+        let vault_state = SplTokenAccount::unpack(&vault_data)
+            .map_err(|_| VestingError::InvalidTokenAccount)?;
+        require_keys_eq!(vault_state.mint, mint, VestingError::InvalidTokenMint);
+        vault_state.amount
+    };
 
-        // Enforce full funding before any release (released_supply == 0).
-        if st.released_supply == 0 {
-            require!(vault_balance == st.total_supply, VestingError::VaultNotExactlyFunded);
-        }
+    if released_supply == 0 {
+        require!(vault_balance == total_supply, VestingError::VaultNotExactlyFunded);
+    }
 
-        let signer_seeds: &[&[&[u8]]] = &[&[b"schedule_state", &[ctx.bumps.schedule_state]]];
+    let signer_seeds: &[&[&[u8]]] = &[&[b"schedule_state", &[ctx.bumps.schedule_state]]];
+
+    // Phase 1: calculate all releasable amounts, update recipient entries.
+    // Drop recipients borrow before CPI loop.
+    let mut releasables: Vec<(usize, u64, u64, u64)> = Vec::new(); // (remaining_accounts idx, releasable, allocation, new_released)
+
+    {
+        let mut recipients = ctx.accounts.recipients.load_mut()?;
 
         for (i, wallet) in wallets.iter().enumerate() {
             let ata_ai = &ctx.remaining_accounts[i];
 
-            // Canonical ATA check.
             let expected = {
                 let seeds: &[&[u8]] = &[
                     wallet.as_ref(),
                     anchor_spl::token::ID.as_ref(),
-                    st.mint.as_ref(),
+                    mint.as_ref(),
                 ];
                 let (ata, _) =
                     Pubkey::find_program_address(seeds, &anchor_spl::associated_token::ID);
@@ -181,23 +184,19 @@ pub mod vesting {
             };
             require_keys_eq!(ata_ai.key(), expected, VestingError::InvalidRecipientAta);
 
-            // Token account must be SPL Token owned; unpack and validate mint/owner.
             require_keys_eq!(*ata_ai.owner, token_program_key, VestingError::InvalidTokenProgram);
             {
                 let ata_data = ata_ai.try_borrow_data()?;
                 let ata_state = SplTokenAccount::unpack(&ata_data)
                     .map_err(|_| VestingError::InvalidTokenAccount)?;
-                require_keys_eq!(ata_state.mint, st.mint, VestingError::InvalidTokenMint);
+                require_keys_eq!(ata_state.mint, mint, VestingError::InvalidTokenMint);
                 require_keys_eq!(ata_state.owner, *wallet, VestingError::InvalidTokenAccount);
             }
 
-            // Find recipient entry.
-            let entry = ctx
-                .accounts
-                .recipients
+            let entry = recipients
                 .entries
                 .iter_mut()
-                .take(st.recipient_count as usize)
+                .take(recipient_count as usize)
                 .find(|e| e.wallet == *wallet)
                 .ok_or(VestingError::RecipientNotFound)?;
 
@@ -231,43 +230,56 @@ pub mod vesting {
 
             require!(vault_balance >= releasable, VestingError::InsufficientVaultBalance);
 
-            token::transfer(
-                CpiContext::new_with_signer(
-                    token_program_ai.clone(),
-                    Transfer {
-                        from: vault_ai.clone(),
-                        to: ata_ai.clone(),
-                        authority: schedule_state_ai.clone(),
-                    },
-                    signer_seeds,
-                ),
-                releasable,
-            )?;
+            let new_released = entry
+                .released_amount
+                .checked_add(releasable)
+                .ok_or(VestingError::MathOverflow)?;
+            entry.released_amount = new_released;
 
             vault_balance = vault_balance
                 .checked_sub(releasable)
                 .ok_or(VestingError::MathOverflow)?;
 
-            entry.released_amount = entry
-                .released_amount
-                .checked_add(releasable)
-                .ok_or(VestingError::MathOverflow)?;
-            st.released_supply = st
-                .released_supply
-                .checked_add(releasable)
-                .ok_or(VestingError::MathOverflow)?;
-
-            emit!(instructions::batch_release::TokensReleasedBatchItem {
-                wallet: *wallet,
-                month_index: month_idx,
-                amount: releasable,
-                allocation: entry.allocation,
-                released_total: entry.released_amount,
-            });
+            releasables.push((i, releasable, entry.allocation, new_released));
         }
+    } // recipients borrow drop hota hai yahan
 
-        Ok(())
+    // Phase 2: CPI transfers.
+    for (i, releasable, allocation, released_total) in releasables.iter() {
+        let ata_ai = &ctx.remaining_accounts[*i];
+        let wallet = &wallets[*i];
+
+        token::transfer(
+            CpiContext::new_with_signer(
+                token_program_ai.clone(),
+                Transfer {
+                    from: vault_ai.clone(),
+                    to: ata_ai.clone(),
+                    authority: schedule_state_ai.clone(),
+                },
+                signer_seeds,
+            ),
+            *releasable,
+        )?;
+
+        released_supply = released_supply
+            .checked_add(*releasable)
+            .ok_or(VestingError::MathOverflow)?;
+
+        emit!(instructions::batch_release::TokensReleasedBatchItem {
+            wallet: *wallet,
+            month_index: month_idx,
+            amount: *releasable,
+            allocation: *allocation,
+            released_total: *released_total,
+        });
     }
+
+    // Update schedule_state released_supply after all CPIs.
+    ctx.accounts.schedule_state.released_supply = released_supply;
+
+    Ok(())
+}
 
     /// Emit a read-only vesting quote log for UX/parity checks.
     pub fn emit_vesting_quote(ctx: Context<EmitVestingQuote>, wallet: Pubkey) -> Result<()> {

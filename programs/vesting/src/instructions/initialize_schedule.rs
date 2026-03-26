@@ -86,7 +86,7 @@ pub struct InitializeSchedule<'info> {
         seeds = [b"recipients", schedule_state.key().as_ref()],
         bump
     )]
-    pub recipients: Box<Account<'info, Recipients>>,
+    pub recipients: AccountLoader<'info, Recipients>,
 
     #[account(
         init,
